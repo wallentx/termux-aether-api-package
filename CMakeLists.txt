@@ -52,6 +52,7 @@ set(script_files
   scripts/termux-saf-write
   scripts/termux-sensor
   scripts/termux-share
+  scripts/termux-shizuku
   scripts/termux-sms-inbox
   scripts/termux-sms-list
   scripts/termux-sms-send
