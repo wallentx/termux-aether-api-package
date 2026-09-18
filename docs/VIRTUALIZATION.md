@@ -17,3 +17,17 @@ for inline commands, reusing a running VM and mapping shared working directories
 The existing PRoot installation and launch commands remain unchanged.
 
 See the [API implementation and Arch acceptance plan](https://github.com/wallentx/termux-api/blob/wallentx/capabilities/docs/VIRTUALIZATION.md).
+
+## Experimental Arch guest lifecycle
+
+`termux-arch-vm --start`, `--status` (default), and `--stop` use the API fork's
+fixed Shizuku VM service. The current guest is a fresh read-only Arch boot proof:
+one vCPU, 1 GiB RAM, no network and no guest command execution. It requires the
+separately verified/staged CI image and authorized shell Shizuku. The command
+accepts no image paths, shell text or VM IDs. JSON `status=ready` and
+`guest_boot=verified` indicate the guest readiness marker was observed;
+CLI exit 0 only establishes delivery, not boot success.
+
+The existing `termux-virtualization` command stays read-only. Neither command
+changes existing `Æ`/`æ` or PRoot installations. See the API fork's
+`docs/VIRTUALIZATION.md` for image build, staging and lifecycle guarantees.

@@ -22,6 +22,7 @@ set(script_files
   scripts/termux-camera-info
   scripts/termux-camera-photo
   scripts/termux-capabilities
+  scripts/termux-arch-vm
   scripts/termux-virtualization
   scripts/termux-clipboard-get
   scripts/termux-clipboard-set
