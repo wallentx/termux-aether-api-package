@@ -1,0 +1,21 @@
+name: CLI tests
+on:
+  push:
+    branches: [master, 'wallentx/**']
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  test:
+    if: >-
+      github.event_name != 'pull_request' ||
+      github.event.pull_request.head.repo.full_name != github.repository ||
+      (!startsWith(github.head_ref, 'wallentx/') && github.head_ref != 'master')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Test capability command
+        run: |
+          sh -n scripts/termux-capabilities.in
+          python3 -B -m unittest discover -s tests -p 'test_*.py'
