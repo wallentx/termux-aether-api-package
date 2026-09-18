@@ -1,0 +1,19 @@
+#!@TERMUX_PREFIX@/bin/sh
+set -eu
+usage() {
+    echo 'Usage: termux-arch-vm [--status | --start | --stop]'
+    echo 'Manage the fixed experimental Arch AVF guest through authorized Shizuku.'
+    echo 'Requires separately staged CI guest images. Root disk is read-only; no networking.'
+    echo 'JSON status reports boot readiness; command exit 0 only confirms transport.'
+}
+operation=status
+if [ "$#" -gt 1 ]; then usage >&2; exit 2; fi
+case "${1:---status}" in
+    --status) operation=status ;;
+    --start) operation=start ;;
+    --stop) operation=stop ;;
+    -h|--help) usage; exit 0 ;;
+    *) usage >&2; exit 2 ;;
+esac
+exec "@TERMUX_PREFIX@/bin/timeout" --foreground 20 \
+    "@TERMUX_PREFIX@/libexec/termux-api" Virtualization --es operation "arch-$operation"

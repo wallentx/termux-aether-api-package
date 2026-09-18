@@ -20,4 +20,5 @@ jobs:
           sh -n scripts/termux-capabilities.in
           sh -n scripts/termux-shizuku.in
           sh -n scripts/termux-virtualization.in
+          sh -n scripts/termux-arch-vm.in
           python3 -B -m unittest discover -s tests -p 'test_*.py'
