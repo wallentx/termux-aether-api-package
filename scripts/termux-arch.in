@@ -85,6 +85,13 @@ def ensure_ready(key):
 
 
 def pin_host(directory, key):
+    fd = os.open(directory / 'setup.lock', os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(fd, 'w') as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        return _pin_host(directory, key)
+
+
+def _pin_host(directory, key):
     expected = f'termux-arch-v2 {public_key(key)}\n'
     path = directory / 'known_hosts'
     try:
