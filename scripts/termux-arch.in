@@ -1,0 +1,154 @@
+#!@TERMUX_PREFIX@/bin/python
+"""Open the persistent Arch AVF guest using authenticated SSH over vsock."""
+import argparse
+import base64
+import fcntl
+import json
+import os
+from pathlib import Path
+import shlex
+import shutil
+import stat
+import subprocess
+import sys
+import tempfile
+import time
+
+PREFIX = '@TERMUX_PREFIX@'
+
+
+def public_key(value):
+    if not isinstance(value, str):
+        raise ValueError("Expected an Ed25519 public key")
+    parts = value.split()
+    if len(parts) != 2 or parts[0] != 'ssh-ed25519':
+        raise ValueError('Expected an Ed25519 public key')
+    raw = base64.b64decode(parts[1], validate=True)
+    if len(raw) != 51 or raw[:19] != b'\0\0\0\x0bssh-ed25519\0\0\0\x20':
+        raise ValueError('Invalid Ed25519 public key')
+    return ' '.join(parts)
+
+
+def credentials(directory):
+    directory.mkdir(parents=True, mode=0o700, exist_ok=True)
+    info = directory.lstat()
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077:
+        raise ValueError(f'Credential directory must be owned by you and mode 700: {directory}')
+    lock = os.open(directory / 'setup.lock', os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(lock, 'w') as stream:
+        fcntl.flock(stream, fcntl.LOCK_EX)
+        identity = directory / 'id_ed25519'
+        if not identity.exists():
+            # A unique temporary path prevents a partial key from becoming active.
+            with tempfile.TemporaryDirectory(prefix='key-', dir=directory) as work:
+                temporary = Path(work) / 'identity'
+                subprocess.run(['ssh-keygen', '-q', '-t', 'ed25519', '-N', '', '-C', 'termux-arch-v2',
+                                '-f', str(temporary)], check=True, timeout=15)
+                os.replace(temporary.with_suffix('.pub'), identity.with_suffix('.pub'))
+                os.replace(temporary, identity)
+        info = identity.lstat()
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077:
+            raise ValueError('SSH private key must be a private regular file owned by you')
+        # Derive the public key from the private key rather than trusting a stale .pub.
+        value = subprocess.check_output(['ssh-keygen', '-y', '-f', str(identity)], text=True, timeout=10)
+        key = public_key(' '.join(value.split()[:2]))
+        return identity, key
+
+
+def api(operation, key=None):
+    command = [f'{PREFIX}/bin/timeout', '--foreground', '20', f'{PREFIX}/libexec/termux-api',
+               'Virtualization', '--es', 'operation', 'arch-' + operation]
+    if key is not None:
+        command += ['--es', 'ssh_public_key', key]
+    result = subprocess.run(command, capture_output=True, text=True, timeout=22)
+    if result.returncode:
+        raise RuntimeError(f'VM API transport failed ({result.returncode}): {result.stderr.strip()}')
+    return json.loads(result.stdout)
+
+
+def ensure_ready(key):
+    report = api('start', key)
+    deadline = time.monotonic() + 60
+    while report.get('status') in ('starting', 'booting'):
+        if time.monotonic() >= deadline:
+            raise TimeoutError('Arch did not become ready in 60 seconds; inspect termux-arch-vm --status')
+        time.sleep(0.25)
+        report = api('status')
+    if report.get('status') != 'ready' or not report.get('running'):
+        raise RuntimeError(f"Arch is not ready: {report.get('reason') or report.get('status')}")
+    if report.get('vm_name') != 'termux-arch-v2' or not isinstance(report.get('ssh_port'), int):
+        raise RuntimeError('API does not provide the expected Arch SSH endpoint')
+    if not 1 <= report['ssh_port'] <= 65535:
+        raise RuntimeError('Invalid SSH endpoint port')
+    public_key(report.get('ssh_host_key', ''))
+    return report
+
+
+def pin_host(directory, key):
+    expected = f'termux-arch-v2 {public_key(key)}\n'
+    path = directory / 'known_hosts'
+    try:
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    except FileExistsError:
+        if path.is_symlink() or path.read_text() != expected:
+            raise RuntimeError('Arch SSH host key changed; inspect the guest before replacing known_hosts')
+    else:
+        with os.fdopen(fd, 'w') as stream:
+            stream.write(expected)
+    return path
+
+
+def remote_command(cwd, command):
+    if not cwd.startswith('/') or '\0' in cwd:
+        raise ValueError('--cwd must be an absolute guest path')
+    if any('\0' in arg for arg in command):
+        raise ValueError('Command arguments cannot contain NUL')
+    return 'cd -- ' + shlex.quote(cwd) + ' && exec ' + shlex.join(command or ['/bin/bash', '-l'])
+
+
+def ssh_command(identity, known, port, cwd, command, tty):
+    return ['ssh', '-F', '/dev/null', '-i', str(identity), '-p', str(port),
+            '-o', 'BatchMode=yes', '-o', 'IdentitiesOnly=yes', '-o', 'IdentityAgent=none',
+            '-o', 'StrictHostKeyChecking=yes', '-o', f'UserKnownHostsFile="{known}"',
+            '-o', 'GlobalKnownHostsFile=/dev/null', '-o', 'HostKeyAlias=termux-arch-v2',
+            '-o', 'ConnectTimeout=5', '-o', 'ServerAliveInterval=15', '-o', 'ServerAliveCountMax=3',
+            '-o', 'ClearAllForwardings=yes', '-o', 'EscapeChar=none', '-tt' if tty else '-T',
+            'root@127.0.0.1', remote_command(cwd, command)]
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__, epilog='Guest paths only; Android project directories are not shared.')
+    parser.add_argument('--cwd', help='Absolute path inside Arch (home is /root)')
+    parser.add_argument('--shell', action='store_true', help='Open a login shell in the guest home')
+    parser.add_argument('--tty', action='store_true', help='Allocate a guest PTY for a command')
+    parser.add_argument('command', nargs=argparse.REMAINDER)
+    args = parser.parse_args(argv)
+    command = args.command
+    if command and command[0] == '--':
+        command = command[1:]
+    if args.shell and command:
+        parser.error('--shell does not accept a command')
+    cwd = args.cwd
+    if cwd is None:
+        if command and Path.cwd() != Path.home():
+            parser.error('Host directories are not shared. Pass --cwd /root or another guest path.')
+        cwd = '/root'
+    remote_command(cwd, command)  # Validate before starting the VM.
+    for program in ('ssh', 'ssh-keygen'):
+        if shutil.which(program) is None:
+            raise RuntimeError('Install the openssh package in Termux first')
+    directory = Path.home() / '.config/termux/arch-vm'
+    identity, key = credentials(directory)
+    report = ensure_ready(key)
+    known = pin_host(directory, report['ssh_host_key'])
+    invocation = ssh_command(identity, known, report['ssh_port'], cwd, command, args.tty or not command)
+    # Do not retry a failed SSH command: it may already have changed guest files.
+    os.execvp(invocation[0], invocation)
+
+
+if __name__ == '__main__':
+    try:
+        main()
+    except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as error:
+        print(f'termux-arch: {error}', file=sys.stderr)
+        sys.exit(1)
