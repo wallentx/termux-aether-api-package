@@ -20,3 +20,12 @@ than Termux home requires an explicit guest `--cwd`. Install the wrappers only o
 the intended Pixel; preserve existing PRoot launchers on other devices. Client
 credentials live in `~/.config/termux/arch-vm`, and a changed guest host key fails
 closed. No speed advantage over PRoot has been measured yet.
+
+### Arch session lifetime
+
+`Æ` and `æ command args...` start/resume Arch on demand. The last session exit
+cleanly shuts down the guest and releases its RAM. Use `Æ --keep-memory` or
+`æ --keep-memory command args...` to suspend instead, retaining RAM and processes.
+The next ordinary invocation restores default shutdown behavior. Background jobs
+stop on shutdown and freeze on suspension. For explicitly manual lifetime, use
+`termux-arch --start` and `termux-arch-vm --stop`.

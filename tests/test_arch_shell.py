@@ -7,7 +7,7 @@ from pathlib import Path
 import subprocess
 import tempfile
 import unittest
-from unittest.mock import patch, call
+from unittest.mock import patch, call, Mock
 
 source = Path(__file__).resolve().parents[1] / 'scripts/termux-arch.in'
 loader = importlib.machinery.SourceFileLoader('arch_shell', str(source))
@@ -18,6 +18,68 @@ KEY = 'ssh-ed25519 ' + base64.b64encode(b'\0\0\0\x0bssh-ed25519\0\0\0\x20' + byt
 
 
 class ArchShellTest(unittest.TestCase):
+    def test_session_releases_after_command_failure_without_masking_it(self):
+        responses = [dict(session_lifecycle=True, session_status='acquired'),
+                     dict(session_status='released', running=False)]
+        with patch.object(module, 'api', side_effect=responses) as api:
+            with self.assertRaisesRegex(ValueError, 'guest failure'):
+                with module.vm_session(True):
+                    raise ValueError('guest failure')
+        acquire, release = api.call_args_list
+        self.assertEqual('session-acquire', acquire.args[0])
+        self.assertTrue(acquire.kwargs['keep_memory'])
+        self.assertEqual(acquire.kwargs['token'], release.kwargs['token'])
+        self.assertEqual('session-release', release.args[0])
+
+    def test_release_failure_does_not_replace_guest_status(self):
+        with patch.object(module, 'api', side_effect=[dict(session_lifecycle=True, session_status='acquired'),
+                                                       RuntimeError('transport lost')]), \
+             patch('sys.stderr') as error:
+            with module.vm_session():
+                self.assertEqual(37, module.run_ssh(['sh', '-c', 'exit 37']))
+            self.assertTrue(error.write.called)
+
+    def test_other_session_prevents_idle_wait(self):
+        with patch.object(module, 'api', side_effect=[dict(session_lifecycle=True, session_status='acquired'),
+                dict(session_status='released', running=True, active_sessions=1)]) as api:
+            with module.vm_session():
+                pass
+            self.assertEqual(2, api.call_count)
+
+    def test_closing_ssh_connection_is_given_time_to_drain(self):
+        responses = [dict(session_lifecycle=True, session_status='acquired'),
+                     dict(session_status='released', running=True, ssh_connections=1),
+                     dict(running=True, ssh_connections=0), dict(running=False)]
+        with patch.object(module, 'api', side_effect=responses) as api, patch.object(module.time, 'sleep'):
+            with module.vm_session():
+                pass
+            self.assertEqual(4, api.call_count)
+
+    def test_busy_shutdown_is_retried_before_acquiring(self):
+        with patch.object(module, 'api', side_effect=[dict(session_lifecycle=True, session_status='busy'),
+                dict(session_lifecycle=True, session_status='acquired'),
+                dict(session_status='released', running=False)]) as api, patch.object(module.time, 'sleep'):
+            with module.vm_session():
+                pass
+            self.assertEqual(['session-acquire', 'session-acquire', 'session-release'],
+                             [entry.args[0] for entry in api.call_args_list])
+
+    def test_old_api_is_rejected_before_running_guest(self):
+        with patch.object(module, 'api', return_value={'status': 'unsupported'}):
+            with self.assertRaisesRegex(RuntimeError, 'Update Termux:API'):
+                with module.vm_session():
+                    self.fail('Must not enter a guest without idle lifecycle support')
+
+    def test_interrupted_ssh_is_reaped_before_releasing_session(self):
+        child = Mock()
+        child.wait.side_effect = [KeyboardInterrupt(), 143]
+        child.poll.return_value = None
+        with patch.object(module.subprocess, 'Popen', return_value=child), \
+             self.assertRaises(KeyboardInterrupt):
+            module.run_ssh(['ssh'])
+        child.terminate.assert_called_once()
+        self.assertEqual(2, child.wait.call_count)
+
     def test_memory_units_and_exact_mib(self):
         for value, expected in [('8G', 8192), ('1.5GiB', 1536), ('8192M', 8192), ('512mib', 512), ('6144', 6144)]:
             self.assertEqual(expected, module.memory_mib(value))
