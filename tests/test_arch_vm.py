@@ -43,6 +43,24 @@ class ArchVmCliTest(unittest.TestCase):
         self.assertEqual(0, self.invoke("--help").returncode)
         self.assertFalse(self.marker.exists())
 
+    def test_memory_forwarding_preserves_argument_boundaries(self):
+        launcher = self.prefix / 'bin/termux-arch'
+        launcher.write_text('#!/bin/sh\nprintf \'%s\\n\' "$@" > "' + str(self.marker) + '"\n')
+        launcher.chmod(0o700)
+        for args, size in [(('--start', '--memory', '6G'), '6G'),
+                           (('--memory=8192M', '--start'), '8192M'),
+                           (('--start', '--memory', '8G;exit 99'), '8G;exit 99')]:
+            self.assertEqual(0, self.invoke(*args).returncode)
+            self.assertEqual(['--start', '--memory', size], self.marker.read_text().splitlines())
+
+    def test_memory_requires_start_and_one_nonempty_value(self):
+        for args in (('--memory', '8G'), ('--stop', '--memory', '8G'),
+                     ('--start', '--memory'), ('--start', '--memory='),
+                     ('--start', '--memory', ''), ('--start', '--memory', '6G', '--memory=8G')):
+            with self.subTest(args=args):
+                self.assertEqual(2, self.invoke(*args).returncode)
+        self.assertFalse(self.marker.exists())
+
     def test_deadline_is_preserved(self):
         (self.prefix / "bin/timeout").write_text('#!/bin/sh\nexit 124\n')
         self.assertEqual(124, self.invoke().returncode)
