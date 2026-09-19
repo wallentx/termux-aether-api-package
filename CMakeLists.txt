@@ -23,6 +23,9 @@ set(script_files
   scripts/termux-camera-photo
   scripts/termux-capabilities
   scripts/termux-arch-vm
+  scripts/termux-arch
+  scripts/Æ
+  scripts/æ
   scripts/termux-virtualization
   scripts/termux-clipboard-get
   scripts/termux-clipboard-set

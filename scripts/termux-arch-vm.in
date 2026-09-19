@@ -3,7 +3,7 @@ set -eu
 usage() {
     echo 'Usage: termux-arch-vm [--status | --start | --stop]'
     echo 'Manage the fixed experimental Arch AVF guest through authorized Shizuku.'
-    echo 'Requires separately staged CI guest images. Root disk is read-only; no networking.'
+    echo 'Requires staged v2 CI guest images. Writable guest; use termux-arch for first-time SSH setup.'
     echo 'JSON status reports boot readiness; command exit 0 only confirms transport.'
 }
 operation=status
