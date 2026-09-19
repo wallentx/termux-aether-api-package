@@ -1,6 +1,7 @@
 #!@TERMUX_PREFIX@/bin/python
 """Open the persistent Arch AVF guest using authenticated SSH over vsock."""
 import argparse
+from contextlib import contextmanager
 from decimal import Decimal, InvalidOperation
 import base64
 import fcntl
@@ -10,11 +11,14 @@ import re
 from pathlib import Path
 import shlex
 import shutil
+import signal
 import stat
 import subprocess
 import sys
 import tempfile
 import time
+import threading
+import uuid
 
 PREFIX = '@TERMUX_PREFIX@'
 
@@ -70,17 +74,104 @@ def credentials(directory):
         return identity, key
 
 
-def api(operation, key=None, memory=None):
+def api(operation, key=None, memory=None, *, token=None, keep_memory=False):
     command = [f'{PREFIX}/bin/timeout', '--foreground', '20', f'{PREFIX}/libexec/termux-api',
                'Virtualization', '--es', 'operation', 'arch-' + operation]
     if key is not None:
         command += ['--es', 'ssh_public_key', key]
     if memory is not None:
         command += ['--es', 'memory_mib', str(memory)]
+    if token is not None:
+        command += ['--es', 'session_token', token, '--ez', 'keep_memory', str(keep_memory).lower()]
     result = subprocess.run(command, capture_output=True, text=True, timeout=22)
     if result.returncode:
         raise RuntimeError(f'VM API transport failed ({result.returncode}): {result.stderr.strip()}')
     return json.loads(result.stdout)
+
+
+@contextmanager
+def vm_session(keep_memory=False):
+    token = uuid.uuid4().hex
+    deadline = time.monotonic() + 30
+    while True:
+        report = api('session-acquire', token=token, keep_memory=keep_memory)
+        if report.get('session_lifecycle') is not True:
+            raise RuntimeError('Update Termux:API for automatic Arch session cleanup')
+        state = report.get('session_status')
+        if state == 'acquired':
+            break
+        if state != 'busy' or time.monotonic() >= deadline:
+            raise RuntimeError(f'Cannot acquire Arch session: {state or report.get("reason", "unknown error")}')
+        time.sleep(.25)
+
+    done = threading.Event()
+
+    def heartbeat():
+        while not done.wait(15):
+            try:
+                response = api('session-renew', token=token)
+                if response.get('session_status') != 'renewed':
+                    raise RuntimeError('session lease expired')
+            except Exception as error:
+                if not done.is_set():
+                    print(f'termux-arch: session renewal failed: {error}', file=sys.stderr)
+                # A live SSH connection also prevents idle shutdown.
+
+    thread = threading.Thread(target=heartbeat, name='arch-session-lease', daemon=True)
+    thread.start()
+    try:
+        yield
+    finally:
+        done.set()
+        thread.join(timeout=1)
+        try:
+            report = api('session-release', token=token)
+            if report.get('session_status') != 'released':
+                raise RuntimeError(report.get('reason', 'session release was not acknowledged'))
+            closing_connection_deadline = time.monotonic() + 2
+            deadline = time.monotonic() + 18
+            while report.get('running') and not report.get('suspended'):
+                if report.get('active_sessions', 0):
+                    break  # Another tracked session owns the guest.
+                if report.get('ssh_connections', 0) and time.monotonic() >= closing_connection_deadline:
+                    break  # A raw SSH connection still owns the guest.
+                if report.get('idle_error') or report.get('reason'):
+                    raise RuntimeError(report.get('idle_error') or report['reason'])
+                if time.monotonic() >= deadline:
+                    raise TimeoutError('idle transition did not finish; inspect termux-arch-vm --status')
+                time.sleep(.25)
+                report = api('status')
+        except Exception as error:
+            # Cleanup errors must not replace the guest command's exit status.
+            print(f'termux-arch: automatic idle cleanup: {error}', file=sys.stderr)
+
+
+def run_ssh(invocation):
+    previous = {}
+
+    def interrupted(number, _frame):
+        raise SystemExit(128 + number)
+
+    for number in (signal.SIGTERM, signal.SIGHUP):
+        previous[number] = signal.signal(number, interrupted)
+    child = None
+    try:
+        child = subprocess.Popen(invocation)
+        try:
+            status = child.wait()
+            return status if status >= 0 else 128 - status
+        except BaseException:
+            if child.poll() is None:
+                child.terminate()
+                try:
+                    child.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    child.kill()
+                    child.wait()
+            raise
+    finally:
+        for number, handler in previous.items():
+            signal.signal(number, handler)
 
 
 def ensure_ready(key, memory=None):
@@ -159,6 +250,8 @@ def main(argv=None):
     parser.add_argument('--start', action='store_true', help='Start the VM, wait for readiness and print JSON status')
     parser.add_argument('--memory', type=memory_mib, metavar='SIZE',
                         help='Guest RAM ceiling (8G, 8192M or MiB); saved after successful boot. Changes require a stopped VM.')
+    parser.add_argument('--keep-memory', action='store_true',
+                        help='Suspend instead of shutting down after the last session; retains guest RAM and processes')
     parser.add_argument('--tty', action='store_true', help='Allocate a guest PTY for a command')
     parser.add_argument('command', nargs=argparse.REMAINDER)
     args = parser.parse_args(argv)
@@ -167,6 +260,8 @@ def main(argv=None):
         command = command[1:]
     if args.shell and command:
         parser.error('--shell does not accept a command')
+    if args.start and args.keep_memory:
+        parser.error('--keep-memory requires a shell or command, not --start')
     if args.start and (command or args.shell):
         parser.error('--start does not accept --shell or a guest command')
     cwd = args.cwd
@@ -180,19 +275,22 @@ def main(argv=None):
             raise RuntimeError('Install the openssh package in Termux first')
     directory = Path.home() / '.config/termux/arch-vm'
     identity, key = credentials(directory)
-    report = ensure_ready(key, args.memory)
     if args.start:
-        print(json.dumps(report, indent=2))
-        return
-    known = pin_host(directory, report['ssh_host_key'])
-    invocation = ssh_command(identity, known, report['ssh_port'], cwd, command, args.tty or not command)
-    # Do not retry a failed SSH command: it may already have changed guest files.
-    os.execvp(invocation[0], invocation)
+        print(json.dumps(ensure_ready(key, args.memory), indent=2))
+        return 0
+    with vm_session(args.keep_memory):
+        report = ensure_ready(key, args.memory)
+        known = pin_host(directory, report['ssh_host_key'])
+        invocation = ssh_command(identity, known, report['ssh_port'], cwd, command, args.tty or not command)
+        # Do not retry a failed SSH command: it may already have changed guest files.
+        return run_ssh(invocation)
 
 
 if __name__ == '__main__':
     try:
-        main()
+        sys.exit(main())
+    except KeyboardInterrupt:
+        sys.exit(130)
     except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as error:
         print(f'termux-arch: {error}', file=sys.stderr)
         sys.exit(1)
