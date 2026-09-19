@@ -1,7 +1,12 @@
 #!@TERMUX_PREFIX@/bin/sh
 set -eu
+case "${1-}" in
+    --memory-live|--grow-disk)
+        exec "@TERMUX_PREFIX@/bin/termux-arch-resources" "$@" ;;
+esac
 usage() {
     echo 'Usage: termux-arch-vm [--status | --start [--memory SIZE] | --stop]'
+    echo '       termux-arch-vm [--memory-live SIZE | --grow-disk SIZE]'
     echo 'RAM sizes: 8G, 8192M, or MiB. Saved after successful boot; changes require a stopped VM.'
     echo 'Manage the fixed experimental Arch AVF guest through authorized Shizuku.'
     echo 'Requires staged v2 CI guest images. Writable guest; use termux-arch for first-time SSH setup.'

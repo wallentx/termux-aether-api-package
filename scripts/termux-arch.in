@@ -74,7 +74,7 @@ def credentials(directory):
         return identity, key
 
 
-def api(operation, key=None, memory=None, *, token=None, keep_memory=False):
+def api(operation, key=None, memory=None, *, token=None, keep_memory=False, disk_bytes=None):
     command = [f'{PREFIX}/bin/timeout', '--foreground', '20', f'{PREFIX}/libexec/termux-api',
                'Virtualization', '--es', 'operation', 'arch-' + operation]
     if key is not None:
@@ -83,6 +83,8 @@ def api(operation, key=None, memory=None, *, token=None, keep_memory=False):
         command += ['--es', 'memory_mib', str(memory)]
     if token is not None:
         command += ['--es', 'session_token', token, '--ez', 'keep_memory', str(keep_memory).lower()]
+    if disk_bytes is not None:
+        command += ['--es', 'disk_bytes', str(disk_bytes)]
     result = subprocess.run(command, capture_output=True, text=True, timeout=22)
     if result.returncode:
         raise RuntimeError(f'VM API transport failed ({result.returncode}): {result.stderr.strip()}')

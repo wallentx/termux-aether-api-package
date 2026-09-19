@@ -1,0 +1,57 @@
+#!@TERMUX_PREFIX@/bin/python
+"""Resize Arch's sparse disk or request a live RAM balloon target."""
+import argparse
+import importlib.machinery
+import importlib.util
+import json
+from pathlib import Path
+import subprocess
+import sys
+
+
+def load_arch():
+    loader = importlib.machinery.SourceFileLoader('arch_session', '@TERMUX_PREFIX@/bin/termux-arch')
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    return module
+
+
+def main(argv=None):
+    arch = load_arch()
+    parser = argparse.ArgumentParser(description=__doc__)
+    mode = parser.add_mutually_exclusive_group(required=True)
+    mode.add_argument('--memory-live', type=arch.memory_mib, metavar='SIZE', help='Desired guest RAM within its launch ceiling')
+    mode.add_argument('--grow-disk', type=arch.memory_mib, metavar='SIZE', help='New disk capacity; requires a stopped VM, never shrinks')
+    args = parser.parse_args(argv)
+    if args.memory_live is not None:
+        result = arch.api('memory-live', memory=args.memory_live)
+    else:
+        result = arch.api('disk-grow', disk_bytes=args.grow_disk * 1024 * 1024)
+        if result.get('status') == 'error' or result.get('filesystem_growth_required') is not True:
+            raise RuntimeError(result.get('reason') or json.dumps(result))
+        # AVF must reopen the expanded block image before guest ext4 can grow.
+        # An interrupted resize leaves the sparse capacity available for retry.
+        directory = Path.home() / '.config/termux/arch-vm'
+        identity, key = arch.credentials(directory)
+        with arch.vm_session():
+            state = arch.ensure_ready(key)
+            known = arch.pin_host(directory, state['ssh_host_key'])
+            invocation = arch.ssh_command(identity, known, state['ssh_port'], '/', ['resize2fs', '/dev/vda'], False)
+            process = subprocess.run(invocation, stdout=sys.stderr, stderr=sys.stderr, timeout=120)
+            if process.returncode:
+                raise RuntimeError('Disk capacity extended, but ext4 growth failed; retry the same --grow-disk size')
+        result = arch.api('status')
+        result['filesystem_growth_completed'] = True
+    print(json.dumps(result, indent=2))
+    if result.get('status') in ('error', 'unavailable', 'unsupported', 'denied'):
+        return 1
+    return 0
+
+
+if __name__ == '__main__':
+    try:
+        sys.exit(main())
+    except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as error:
+        print(f'termux-arch-resources: {error}', file=sys.stderr)
+        sys.exit(1)
