@@ -24,6 +24,8 @@ set(script_files
   scripts/termux-capabilities
   scripts/termux-arch-vm
   scripts/termux-arch
+  scripts/termux-arch-share
+  scripts/termux-arch-resources
   scripts/Æ
   scripts/æ
   scripts/termux-virtualization
