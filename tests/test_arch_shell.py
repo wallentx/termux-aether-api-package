@@ -1,4 +1,5 @@
 import base64
+import argparse
 import importlib.machinery
 import importlib.util
 import os
@@ -6,7 +7,7 @@ from pathlib import Path
 import subprocess
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import patch, call
 
 source = Path(__file__).resolve().parents[1] / 'scripts/termux-arch.in'
 loader = importlib.machinery.SourceFileLoader('arch_shell', str(source))
@@ -17,6 +18,45 @@ KEY = 'ssh-ed25519 ' + base64.b64encode(b'\0\0\0\x0bssh-ed25519\0\0\0\x20' + byt
 
 
 class ArchShellTest(unittest.TestCase):
+    def test_memory_units_and_exact_mib(self):
+        for value, expected in [('8G', 8192), ('1.5GiB', 1536), ('8192M', 8192), ('512mib', 512), ('6144', 6144)]:
+            self.assertEqual(expected, module.memory_mib(value))
+        for value in ('0', '-1', '1.2M', 'nan', 'inf', '1e3', '8GB', ' 8G', '8G;id', '2147483648', '9' * 100):
+            with self.subTest(value=value), self.assertRaises(argparse.ArgumentTypeError):
+                module.memory_mib(value)
+
+    def test_requested_memory_is_forwarded_and_verified(self):
+        ready = dict(status='ready', running=True, vm_name='termux-arch-v2', ssh_port=22222,
+                     ssh_host_key=KEY, memory_mib=6144)
+        with patch.object(module, 'api', side_effect=[dict(memory_configurable=True, running=False), ready]) as api:
+            self.assertEqual(ready, module.ensure_ready(KEY, 6144))
+            self.assertEqual([call('status'), call('start', KEY, 6144)], api.call_args_list)
+        with patch.object(module, 'api', side_effect=[dict(memory_configurable=True, running=False), ready]):
+            with self.assertRaisesRegex(RuntimeError, 'did not apply requested RAM'):
+                module.ensure_ready(KEY, 8192)
+
+    def test_memory_change_never_stops_a_running_vm(self):
+        with patch.object(module, 'api', return_value=dict(memory_configurable=True, running=True, memory_mib=8192)) as api:
+            with self.assertRaisesRegex(RuntimeError, 'clean stop'):
+                module.ensure_ready(KEY, 6144)
+            api.assert_called_once_with('status')
+        with patch.object(module, 'api', side_effect=[dict(memory_configurable=True, running=False),
+                                                     dict(status='error', reason='memory_change_requires_stop')]) as api:
+            with self.assertRaisesRegex(RuntimeError, 'clean stop'):
+                module.ensure_ready(KEY, 6144)
+            self.assertEqual(['status', 'start'], [c.args[0] for c in api.call_args_list])
+
+    def test_same_memory_reuses_running_vm_and_older_api_fails_before_start(self):
+        ready = dict(status='ready', running=True, memory_configurable=True, memory_mib=8192,
+                     vm_name='termux-arch-v2', ssh_port=22222, ssh_host_key=KEY)
+        with patch.object(module, 'api', return_value=ready) as api:
+            self.assertEqual(ready, module.ensure_ready(KEY, 8192))
+            self.assertNotIn(call('stop'), api.call_args_list)
+        with patch.object(module, 'api', return_value=dict(status='stopped')) as api:
+            with self.assertRaisesRegex(RuntimeError, 'update Termux:API'):
+                module.ensure_ready(KEY, 8192)
+            api.assert_called_once_with('status')
+
     def test_argv_round_trip_without_shell_injection(self):
         args = ['', 'two words', "single'quote", '"double"', '$(touch should-not-exist)', 'line\nbreak', '*', ';exit 9']
         command = module.remote_command(os.getcwd(), ['printf', r'%s\0', *args])

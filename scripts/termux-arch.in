@@ -1,10 +1,12 @@
 #!@TERMUX_PREFIX@/bin/python
 """Open the persistent Arch AVF guest using authenticated SSH over vsock."""
 import argparse
+from decimal import Decimal, InvalidOperation
 import base64
 import fcntl
 import json
 import os
+import re
 from pathlib import Path
 import shlex
 import shutil
@@ -15,6 +17,19 @@ import tempfile
 import time
 
 PREFIX = '@TERMUX_PREFIX@'
+
+
+def memory_mib(value):
+    match = re.fullmatch(r'([0-9]+(?:\.[0-9]+)?)(gib|mib|g|m)?', value, re.I) if len(value) <= 32 else None
+    if not match:
+        raise argparse.ArgumentTypeError('Use a positive memory size such as 8G, 1.5G or 8192M')
+    try:
+        size = Decimal(match[1]) * (1024 if (match[2] or '').lower().startswith('g') else 1)
+        if size != size.to_integral_value() or not 1 <= size <= 2147483647:
+            raise ValueError()
+        return int(size)
+    except (InvalidOperation, ValueError):
+        raise argparse.ArgumentTypeError('Memory must be a positive whole number of MiB')
 
 
 def public_key(value):
@@ -55,19 +70,27 @@ def credentials(directory):
         return identity, key
 
 
-def api(operation, key=None):
+def api(operation, key=None, memory=None):
     command = [f'{PREFIX}/bin/timeout', '--foreground', '20', f'{PREFIX}/libexec/termux-api',
                'Virtualization', '--es', 'operation', 'arch-' + operation]
     if key is not None:
         command += ['--es', 'ssh_public_key', key]
+    if memory is not None:
+        command += ['--es', 'memory_mib', str(memory)]
     result = subprocess.run(command, capture_output=True, text=True, timeout=22)
     if result.returncode:
         raise RuntimeError(f'VM API transport failed ({result.returncode}): {result.stderr.strip()}')
     return json.loads(result.stdout)
 
 
-def ensure_ready(key):
-    report = api('start', key)
+def ensure_ready(key, memory=None):
+    if memory is not None:
+        current = api('status')
+        if current.get('memory_configurable') is not True:
+            raise RuntimeError('The API does not report configurable RAM; update Termux:API or check Shizuku access')
+        if current.get('running') and current.get('memory_mib') != memory:
+            raise RuntimeError('RAM change requires a clean stop: run termux-arch-vm --stop, then retry')
+    report = api('start', key, memory) if memory is not None else api('start', key)
     deadline = time.monotonic() + 60
     while report.get('status') in ('starting', 'booting'):
         if time.monotonic() >= deadline:
@@ -75,7 +98,13 @@ def ensure_ready(key):
         time.sleep(0.25)
         report = api('status')
     if report.get('status') != 'ready' or not report.get('running'):
+        if report.get('reason') == 'memory_change_requires_stop':
+            raise RuntimeError('RAM change requires a clean stop: run termux-arch-vm --stop, then retry')
         raise RuntimeError(f"Arch is not ready: {report.get('reason') or report.get('status')}")
+    if memory is not None and report.get('memory_mib') != memory:
+        raise RuntimeError('API did not apply requested RAM; refusing to execute the guest command')
+    if report.get('memory_preference_error'):
+        print('termux-arch: warning: ' + report['memory_preference_error'], file=sys.stderr)
     if report.get('vm_name') != 'termux-arch-v2' or not isinstance(report.get('ssh_port'), int):
         raise RuntimeError('API does not provide the expected Arch SSH endpoint')
     if not 1 <= report['ssh_port'] <= 65535:
@@ -127,6 +156,9 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__, epilog='Guest paths only; Android project directories are not shared.')
     parser.add_argument('--cwd', help='Absolute path inside Arch (home is /root)')
     parser.add_argument('--shell', action='store_true', help='Open a login shell in the guest home')
+    parser.add_argument('--start', action='store_true', help='Start the VM, wait for readiness and print JSON status')
+    parser.add_argument('--memory', type=memory_mib, metavar='SIZE',
+                        help='Guest RAM ceiling (8G, 8192M or MiB); saved after successful boot. Changes require a stopped VM.')
     parser.add_argument('--tty', action='store_true', help='Allocate a guest PTY for a command')
     parser.add_argument('command', nargs=argparse.REMAINDER)
     args = parser.parse_args(argv)
@@ -135,6 +167,8 @@ def main(argv=None):
         command = command[1:]
     if args.shell and command:
         parser.error('--shell does not accept a command')
+    if args.start and (command or args.shell):
+        parser.error('--start does not accept --shell or a guest command')
     cwd = args.cwd
     if cwd is None:
         if command and Path.cwd() != Path.home():
@@ -146,7 +180,10 @@ def main(argv=None):
             raise RuntimeError('Install the openssh package in Termux first')
     directory = Path.home() / '.config/termux/arch-vm'
     identity, key = credentials(directory)
-    report = ensure_ready(key)
+    report = ensure_ready(key, args.memory)
+    if args.start:
+        print(json.dumps(report, indent=2))
+        return
     known = pin_host(directory, report['ssh_host_key'])
     invocation = ssh_command(identity, known, report['ssh_port'], cwd, command, args.tty or not command)
     # Do not retry a failed SSH command: it may already have changed guest files.
