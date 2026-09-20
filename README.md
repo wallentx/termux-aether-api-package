@@ -3,9 +3,14 @@
 Shell commands for [Termux-Æther:API](https://github.com/wallentx/termux-aether-api),
 including device capabilities, Shizuku diagnostics, Arch VM control, and live
 project sharing. This fork retains the upstream Termux:API command wrappers.
-Use the `wallentx/capabilities` branch with the matching companion APK; the APK
+Use the `dev` branch with the matching companion APK; the APK
 and this command package are separate installations. See the API README for
 [setup and requirements](https://github.com/wallentx/termux-aether-api#setup).
+
+`dev` is the default development branch. `master` is reserved for unchanged
+upstream syncs; rebase `dev` onto it after syncing. The permanent draft **Sync PR**
+from `dev` to `master` is for reviewing the fork delta, including on-demand
+Copilot reviews, and is never intended to be merged.
 
 ### Fresh Arch AVF workspace
 
