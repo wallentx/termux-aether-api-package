@@ -33,6 +33,31 @@ def server_command(local, cache, read_only):
             *(['--read-only'] if read_only else []), str(local)]
 
 
+def unmount(ssh, guest):
+    try:
+        return subprocess.run(ssh(['fusermount3', '-u', '--', guest]), timeout=20).returncode == 0
+    except (OSError, subprocess.SubprocessError) as error:
+        print(f'Guest unmount failed: {error}', file=sys.stderr)
+        return False
+
+
+def stop_child(child, timeout):
+    if child.poll() is not None:
+        return
+    try:
+        child.terminate()
+    except ProcessLookupError:
+        pass
+    try:
+        child.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        try:
+            child.kill()
+        except ProcessLookupError:
+            pass
+        child.wait(timeout=10)
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('local', type=Path, help='Existing Termux directory to share')
@@ -74,10 +99,13 @@ test -z "$(ls -A -- "$1")" || { echo 'Guest mount directory must be empty' >&2; 
             server = subprocess.Popen(server_command(local, cache, args.read_only), stdin=subprocess.PIPE,
                                       stdout=subprocess.PIPE, env=environment, start_new_session=True)
             client = None
-            stopping = False
-            def request_stop(_number, _frame):
-                nonlocal stopping
-                stopping = True
+            stop_signal = None
+            unmount_on_cleanup = True
+            def request_stop(number, _frame):
+                nonlocal stop_signal
+                # A later Ctrl-C must not cancel a pending termination request.
+                if stop_signal not in (signal.SIGTERM, signal.SIGHUP):
+                    stop_signal = number
             previous = {n: signal.signal(n, request_stop) for n in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)}
             try:
                 # Both processes exchange SFTP over pipes. No new TCP listener or forwarding.
@@ -88,11 +116,17 @@ test -z "$(ls -A -- "$1")" || { echo 'Guest mount directory must be empty' >&2; 
                 server.stdin.close()
                 print(f'Sharing {local} at Arch {args.guest}. Ctrl-C unmounts; this share keeps Arch active.', flush=True)
                 while client.poll() is None:
-                    if stopping:
-                        result = subprocess.run(ssh(['fusermount3', '-u', '--', args.guest]), timeout=20)
-                        if result.returncode:
-                            print('Mount is busy. Close guest files/shells using it, then press Ctrl-C again.', file=sys.stderr)
-                        stopping = False
+                    if stop_signal is not None:
+                        number = stop_signal
+                        if number == signal.SIGINT:
+                            stop_signal = None
+                        unmounted = unmount(ssh, args.guest)
+                        # TERM/HUP also take priority if received during the unmount.
+                        if number != signal.SIGINT or stop_signal in (signal.SIGTERM, signal.SIGHUP):
+                            unmount_on_cleanup = False
+                            return 128 + (stop_signal or number)
+                        if not unmounted:
+                            print('Mount is busy or could not be unmounted. Close guest files/shells using it, then press Ctrl-C again.', file=sys.stderr)
                     time.sleep(.25)
                 result = client.returncode
                 # EOF lets rclone finish pending writes. Keep its persistent cache for recovery.
@@ -101,19 +135,26 @@ test -z "$(ls -A -- "$1")" || { echo 'Guest mount directory must be empty' >&2; 
                     raise RuntimeError(f'Share server exited {server.returncode}; cache retained at {cache}')
                 return result if result >= 0 else 128 - result
             finally:
-                for number, handler in previous.items():
-                    signal.signal(number, handler)
-                if client is not None and client.poll() is None:
-                    # Request a normal unmount before dropping the transport.
-                    subprocess.run(ssh(['fusermount3', '-u', '--', args.guest]), timeout=20)
-                    client.terminate()
-                    client.wait(timeout=10)
-                for stream in (server.stdout, server.stdin):
-                    if not stream.closed:
-                        stream.close()
-                if server.poll() is None:
-                    server.terminate()
-                    server.wait(timeout=30)
+                try:
+                    try:
+                        if client is not None and client.poll() is None:
+                            try:
+                                if unmount_on_cleanup:
+                                    unmount(ssh, args.guest)
+                            finally:
+                                stop_child(client, 10)
+                    finally:
+                        try:
+                            try:
+                                server.stdout.close()
+                            finally:
+                                server.stdin.close()
+                        finally:
+                            stop_child(server, 30)
+                finally:
+                    # Keep TERM/HUP handled until both detached children are stopped.
+                    for number, handler in previous.items():
+                        signal.signal(number, handler)
 
 
 if __name__ == '__main__':
