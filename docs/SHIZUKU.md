@@ -1,6 +1,6 @@
 # termux-shizuku
 
-Requires the matching `wallentx/termux-api` app, Shizuku, the existing API helper,
+Requires the matching `wallentx/termux-aether-api` app, Shizuku, the existing API helper,
 and coreutils `timeout`.
 
 ```sh
@@ -19,7 +19,7 @@ Exit 124 means the 20-second request deadline expired. Exit zero means a respons
 arrived; inspect its `status` for denied, unavailable, partial, busy or other errors.
 Stopping Shizuku or rebooting can make it unavailable until started again.
 
-The [Android integration contract](https://github.com/wallentx/termux-api/blob/wallentx/capabilities/docs/SHIZUKU.md)
+The [Android integration contract](https://github.com/wallentx/termux-aether-api/blob/wallentx/capabilities/docs/SHIZUKU.md)
 describes sensor units, privilege boundaries and cleanup.
 
 Local checks do not compile anything:

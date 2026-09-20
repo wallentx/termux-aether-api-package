@@ -1,5 +1,11 @@
-# termux-api-package
-Termux package containing scripts to call exposed API methods in the [Termux:API](https://github.com/termux/termux-api) app.
+# Termux-Æther CLI companion
+
+Shell commands for [Termux-Æther:API](https://github.com/wallentx/termux-aether-api),
+including device capabilities, Shizuku diagnostics, Arch VM control, and live
+project sharing. This fork retains the upstream Termux:API command wrappers.
+Use the `wallentx/capabilities` branch with the matching companion APK; the APK
+and this command package are separate installations. See the API README for
+[setup and requirements](https://github.com/wallentx/termux-aether-api#setup).
 
 ### Fresh Arch AVF workspace
 
@@ -15,7 +21,7 @@ termux-arch-vm --stop               # Flush, remount read-only and shut down
 
 The ext4 filesystem is writable and persistent across shutdowns. These commands
 use authenticated SSH over vsock. Guest IPv4 networking is available through the
-userspace bridge; Android project sharing is not yet enabled. A command from a host directory other
+userspace bridge; selected-directory sharing is available through `termux-arch-share` below. A command from a host directory other
 than Termux home requires an explicit guest `--cwd`. Install the wrappers only on
 the intended Pixel; preserve existing PRoot launchers on other devices. Client
 credentials live in `~/.config/termux/arch-vm`, and a changed guest host key fails
