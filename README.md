@@ -1,5 +1,7 @@
 # Termux-Æther CLI companion
 
+Coordinated suite releases: [installation, upgrades and component dependencies](https://github.com/wallentx/termux-aether-app/blob/dev/docs/RELEASES.md). The `v1000.0.0` baseline keeps existing app IDs and data paths.
+
 Shell commands for [Termux-Æther:API](https://github.com/wallentx/termux-aether-api),
 including device capabilities, Shizuku diagnostics, Arch VM control, and live
 project sharing. This fork retains the upstream Termux:API command wrappers.
@@ -73,3 +75,9 @@ sharing feature, not a security sandbox for hostile guest code.
 
 Implementation references: [rclone SFTP stdio](https://rclone.org/commands/rclone_serve_sftp/)
 and [SSHFS passive transport](https://github.com/libfuse/sshfs/blob/master/sshfs.rst).
+
+## Native Pacman package
+
+On aarch64 Termux, run `python3 packaging/package.py` to build without installing.
+The package is written to `build/packages/`. `VERSION` owns the release version.
+Use the suite installer for upgrades so the preload remains available throughout the transaction.

@@ -13,6 +13,7 @@ target_link_libraries(termux-api-broadcast termux-api-static)
 
 # TODO: get list through regex or similar
 set(script_files
+  scripts/aether-update
   scripts/termux-api-start
   scripts/termux-api-stop
   scripts/termux-audio-info
@@ -107,7 +108,7 @@ install(
 INSTALL(CODE "execute_process( \
   COMMAND ${CMAKE_COMMAND} -E create_symlink \
   termux-api-broadcast \
-  ${CMAKE_INSTALL_PREFIX}/libexec/termux-api \
+  \$ENV{DESTDIR}${CMAKE_INSTALL_PREFIX}/libexec/termux-api \
   )"
 )
 

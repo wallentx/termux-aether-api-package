@@ -1,0 +1,41 @@
+#!@TERMUX_PREFIX@/bin/python
+"""Download, verify and install the coordinated Termux-Aether release bundle."""
+import argparse
+import hashlib
+from pathlib import Path
+import re
+import subprocess
+import tarfile
+import tempfile
+import urllib.request
+
+parser = argparse.ArgumentParser(description=__doc__)
+parser.add_argument('--check', action='store_true', help='download and validate without installing')
+args = parser.parse_args()
+base = 'https://github.com/wallentx/termux-aether-app/releases/latest/download/'
+name = 'termux-aether-suite-aarch64.tar.xz'
+cache = Path.home() / '.cache/termux-aether'
+cache.mkdir(parents=True, exist_ok=True)
+with tempfile.TemporaryDirectory(prefix='download-', dir=cache) as temporary:
+    archive = Path(temporary) / name
+    print('Downloading the coordinated Aether release...', flush=True)
+    urllib.request.urlretrieve(base + name, archive)
+    checksum = urllib.request.urlopen(base + name + '.sha256', timeout=60).read(1024).decode().split()
+    if len(checksum) != 2 or not re.fullmatch('[a-f0-9]{64}', checksum[0]) or checksum[1] != name:
+        raise SystemExit('Invalid release checksum file')
+    with archive.open('rb') as stream:
+        actual = hashlib.file_digest(stream, 'sha256').hexdigest()
+    if actual != checksum[0]:
+        raise SystemExit('Bundle checksum mismatch; nothing installed')
+    # Keep APKs outside temporary storage until Android has installed both updates.
+    destination = cache / actual
+    destination.mkdir(exist_ok=True)
+    with tarfile.open(archive, 'r:xz') as bundle:
+        for member in bundle.getmembers():
+            if not member.isfile() or Path(member.name).name != member.name:
+                raise SystemExit('Unexpected path/type in release bundle')
+        bundle.extractall(destination, filter='data')
+    command = ['@TERMUX_PREFIX@/bin/sh', str(destination / 'install.sh')]
+    if args.check:
+        command.append('--check')
+    subprocess.run(command, check=True)
