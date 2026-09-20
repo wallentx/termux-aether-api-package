@@ -16,7 +16,7 @@ measured. The future Arch backend should retain `Æ` for interactive use and `æ
 for inline commands, reusing a running VM and mapping shared working directories.
 The existing PRoot installation and launch commands remain unchanged.
 
-See the [API implementation and Arch acceptance plan](https://github.com/wallentx/termux-api/blob/wallentx/capabilities/docs/VIRTUALIZATION.md).
+See the [API implementation and Arch acceptance plan](https://github.com/wallentx/termux-aether-api/blob/wallentx/capabilities/docs/VIRTUALIZATION.md).
 
 ## Experimental Arch guest lifecycle
 

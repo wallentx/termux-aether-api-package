@@ -1,7 +1,7 @@
 # termux-capabilities
 
 `termux-capabilities [--json]` prints a read-only JSON snapshot from the matching
-`wallentx/termux-api` Android app. It requires that companion fork; stock Termux:API
+`wallentx/termux-aether-api` Android app. It requires that companion fork; stock Termux:API
 does not implement the new `Capabilities` method yet.
 
 The command uses the existing `libexec/termux-api` transport and GNU coreutils
@@ -23,7 +23,7 @@ all-files-access state and the transport boundary. No serial number or IMEI is
 included. CPU flags are not proof of SIMD acceleration; battery temperature is not
 CPU temperature. Avoid rapid polling of Android's thermal headroom API.
 
-The [API schema and signing/transport decisions](https://github.com/wallentx/termux-api/blob/wallentx/capabilities/docs/CAPABILITIES.md)
+The [API schema and signing/transport decisions](https://github.com/wallentx/termux-aether-api/blob/wallentx/capabilities/docs/CAPABILITIES.md)
 live with the Android implementation. Compile/package through CI or the Termux
 package infrastructure. The command is registered in CMake's script installation
 list; adding this shell wrapper does not require changing the existing helper binary.
