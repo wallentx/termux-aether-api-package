@@ -1,0 +1,165 @@
+#!@TERMUX_PREFIX@/bin/python
+"""Mount one Termux directory inside Arch over the existing authenticated SSH/vsock connection."""
+import argparse
+import fcntl
+import hashlib
+import importlib.machinery
+import importlib.util
+import os
+from pathlib import Path
+import shlex
+import shutil
+import signal
+import subprocess
+import sys
+import time
+
+PREFIX = '@TERMUX_PREFIX@'
+
+
+def load_arch():
+    loader = importlib.machinery.SourceFileLoader('arch_session', PREFIX + '/bin/termux-arch')
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    return module
+
+
+def server_command(local, cache, read_only):
+    # Ignore user remotes/config and do not follow links outside the selected tree.
+    return ['rclone', 'serve', 'sftp', '--stdio', '--config', '/dev/null',
+            '--copy-links=false', '--links=false', '--dir-cache-time', '0s',
+            '--vfs-cache-mode', 'writes', '--vfs-write-back', '0s', '--cache-dir', str(cache),
+            *(['--read-only'] if read_only else []), str(local)]
+
+
+def unmount(ssh, guest):
+    try:
+        return subprocess.run(ssh(['fusermount3', '-u', '--', guest]), timeout=20).returncode == 0
+    except (OSError, subprocess.SubprocessError) as error:
+        print(f'Guest unmount failed: {error}', file=sys.stderr)
+        return False
+
+
+def stop_child(child, timeout):
+    if child.poll() is not None:
+        return
+    try:
+        child.terminate()
+    except ProcessLookupError:
+        pass
+    try:
+        child.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        try:
+            child.kill()
+        except ProcessLookupError:
+            pass
+        child.wait(timeout=10)
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('local', type=Path, help='Existing Termux directory to share')
+    parser.add_argument('guest', help='Absolute empty mount directory inside Arch')
+    parser.add_argument('--read-only', action='store_true')
+    parser.add_argument('--keep-memory', action='store_true')
+    args = parser.parse_args(argv)
+    local = args.local.expanduser().resolve(strict=True)
+    if not local.is_dir():
+        parser.error('The local path must be a directory')
+    if not args.guest.startswith('/') or '..' in args.guest.split('/') or '\0' in args.guest:
+        parser.error('The guest mount path must be absolute, without .. or NUL')
+    if shutil.which('rclone') is None:
+        parser.error('Install the Termux rclone package first: pacman -S rclone')
+    arch = load_arch()
+    directory = Path.home() / '.config/termux/arch-vm'
+    identity, key = arch.credentials(directory)
+    cache = Path.home() / '.cache/termux/arch-shares' / hashlib.sha256(os.fsencode(local)).hexdigest()
+    cache.mkdir(parents=True, exist_ok=True, mode=0o700)
+    with (cache / 'owner.lock').open('w') as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            parser.error('This directory already has an active share')
+        with arch.vm_session(args.keep_memory):
+            report = arch.ensure_ready(key)
+            known = arch.pin_host(directory, report['ssh_host_key'])
+            def ssh(command):
+                return arch.ssh_command(identity, known, report['ssh_port'], '/', command, False)
+            preflight = ['sh', '-c', '''set -eu
+command -v sshfs >/dev/null || { echo 'Install sshfs in Arch: pacman -S sshfs' >&2; exit 1; }
+test -c /dev/fuse || { echo 'Guest kernel has no FUSE device' >&2; exit 1; }
+mkdir -p -- "$1"
+mountpoint -q -- "$1" && { echo 'Guest directory is already mounted' >&2; exit 1; }
+test -z "$(ls -A -- "$1")" || { echo 'Guest mount directory must be empty' >&2; exit 1; }
+''', 'sh', args.guest]
+            subprocess.run(ssh(preflight), check=True, timeout=20)
+            environment = {k: v for k, v in os.environ.items() if not k.startswith('RCLONE_')}
+            server = subprocess.Popen(server_command(local, cache, args.read_only), stdin=subprocess.PIPE,
+                                      stdout=subprocess.PIPE, env=environment, start_new_session=True)
+            client = None
+            stop_signal = None
+            unmount_on_cleanup = True
+            def request_stop(number, _frame):
+                nonlocal stop_signal
+                # A later Ctrl-C must not cancel a pending termination request.
+                if stop_signal not in (signal.SIGTERM, signal.SIGHUP):
+                    stop_signal = number
+            previous = {n: signal.signal(n, request_stop) for n in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)}
+            try:
+                # Both processes exchange SFTP over pipes. No new TCP listener or forwarding.
+                client = subprocess.Popen(ssh(['sshfs', '-f', '-o',
+                    'slave,dir_cache=no,attr_timeout=0,entry_timeout=0,negative_timeout=0',
+                    ':/', args.guest]), stdin=server.stdout, stdout=server.stdin, start_new_session=True)
+                server.stdout.close()
+                server.stdin.close()
+                print(f'Sharing {local} at Arch {args.guest}. Ctrl-C unmounts; this share keeps Arch active.', flush=True)
+                while client.poll() is None:
+                    if stop_signal is not None:
+                        number = stop_signal
+                        if number == signal.SIGINT:
+                            stop_signal = None
+                        unmounted = unmount(ssh, args.guest)
+                        # TERM/HUP also take priority if received during the unmount.
+                        if number != signal.SIGINT or stop_signal in (signal.SIGTERM, signal.SIGHUP):
+                            unmount_on_cleanup = False
+                            return 128 + (stop_signal or number)
+                        if not unmounted:
+                            print('Mount is busy or could not be unmounted. Close guest files/shells using it, then press Ctrl-C again.', file=sys.stderr)
+                    time.sleep(.25)
+                result = client.returncode
+                # EOF lets rclone finish pending writes. Keep its persistent cache for recovery.
+                server.wait(timeout=30)
+                if server.returncode:
+                    raise RuntimeError(f'Share server exited {server.returncode}; cache retained at {cache}')
+                return result if result >= 0 else 128 - result
+            finally:
+                try:
+                    try:
+                        if client is not None and client.poll() is None:
+                            try:
+                                if unmount_on_cleanup:
+                                    unmount(ssh, args.guest)
+                            finally:
+                                stop_child(client, 10)
+                    finally:
+                        try:
+                            try:
+                                server.stdout.close()
+                            finally:
+                                server.stdin.close()
+                        finally:
+                            stop_child(server, 30)
+                finally:
+                    # Keep TERM/HUP handled until both detached children are stopped.
+                    for number, handler in previous.items():
+                        signal.signal(number, handler)
+
+
+if __name__ == '__main__':
+    try:
+        sys.exit(main())
+    except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as error:
+        print(f'termux-arch-share: {error}', file=sys.stderr)
+        sys.exit(1)

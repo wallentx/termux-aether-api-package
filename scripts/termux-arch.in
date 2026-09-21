@@ -1,0 +1,298 @@
+#!@TERMUX_PREFIX@/bin/python
+"""Open the persistent Arch AVF guest using authenticated SSH over vsock."""
+import argparse
+from contextlib import contextmanager
+from decimal import Decimal, InvalidOperation
+import base64
+import fcntl
+import json
+import os
+import re
+from pathlib import Path
+import shlex
+import shutil
+import signal
+import stat
+import subprocess
+import sys
+import tempfile
+import time
+import threading
+import uuid
+
+PREFIX = '@TERMUX_PREFIX@'
+
+
+def memory_mib(value):
+    match = re.fullmatch(r'([0-9]+(?:\.[0-9]+)?)(gib|mib|g|m)?', value, re.I) if len(value) <= 32 else None
+    if not match:
+        raise argparse.ArgumentTypeError('Use a positive memory size such as 8G, 1.5G or 8192M')
+    try:
+        size = Decimal(match[1]) * (1024 if (match[2] or '').lower().startswith('g') else 1)
+        if size != size.to_integral_value() or not 1 <= size <= 2147483647:
+            raise ValueError()
+        return int(size)
+    except (InvalidOperation, ValueError):
+        raise argparse.ArgumentTypeError('Memory must be a positive whole number of MiB')
+
+
+def public_key(value):
+    if not isinstance(value, str):
+        raise ValueError("Expected an Ed25519 public key")
+    parts = value.split()
+    if len(parts) != 2 or parts[0] != 'ssh-ed25519':
+        raise ValueError('Expected an Ed25519 public key')
+    raw = base64.b64decode(parts[1], validate=True)
+    if len(raw) != 51 or raw[:19] != b'\0\0\0\x0bssh-ed25519\0\0\0\x20':
+        raise ValueError('Invalid Ed25519 public key')
+    return ' '.join(parts)
+
+
+def credentials(directory):
+    directory.mkdir(parents=True, mode=0o700, exist_ok=True)
+    info = directory.lstat()
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077:
+        raise ValueError(f'Credential directory must be owned by you and mode 700: {directory}')
+    lock = os.open(directory / 'setup.lock', os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(lock, 'w') as stream:
+        fcntl.flock(stream, fcntl.LOCK_EX)
+        identity = directory / 'id_ed25519'
+        if not identity.exists():
+            # A unique temporary path prevents a partial key from becoming active.
+            with tempfile.TemporaryDirectory(prefix='key-', dir=directory) as work:
+                temporary = Path(work) / 'identity'
+                subprocess.run(['ssh-keygen', '-q', '-t', 'ed25519', '-N', '', '-C', 'termux-arch-v2',
+                                '-f', str(temporary)], check=True, timeout=15)
+                os.replace(temporary.with_suffix('.pub'), identity.with_suffix('.pub'))
+                os.replace(temporary, identity)
+        info = identity.lstat()
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077:
+            raise ValueError('SSH private key must be a private regular file owned by you')
+        # Derive the public key from the private key rather than trusting a stale .pub.
+        value = subprocess.check_output(['ssh-keygen', '-y', '-f', str(identity)], text=True, timeout=10)
+        key = public_key(' '.join(value.split()[:2]))
+        return identity, key
+
+
+def api(operation, key=None, memory=None, *, token=None, keep_memory=False, disk_bytes=None):
+    command = [f'{PREFIX}/bin/timeout', '--foreground', '20', f'{PREFIX}/libexec/termux-api',
+               'Virtualization', '--es', 'operation', 'arch-' + operation]
+    if key is not None:
+        command += ['--es', 'ssh_public_key', key]
+    if memory is not None:
+        command += ['--es', 'memory_mib', str(memory)]
+    if token is not None:
+        command += ['--es', 'session_token', token, '--ez', 'keep_memory', str(keep_memory).lower()]
+    if disk_bytes is not None:
+        command += ['--es', 'disk_bytes', str(disk_bytes)]
+    result = subprocess.run(command, capture_output=True, text=True, timeout=22)
+    if result.returncode:
+        raise RuntimeError(f'VM API transport failed ({result.returncode}): {result.stderr.strip()}')
+    return json.loads(result.stdout)
+
+
+@contextmanager
+def vm_session(keep_memory=False):
+    token = uuid.uuid4().hex
+    deadline = time.monotonic() + 30
+    while True:
+        report = api('session-acquire', token=token, keep_memory=keep_memory)
+        if report.get('session_lifecycle') is not True:
+            raise RuntimeError('Update Termux:API for automatic Arch session cleanup')
+        state = report.get('session_status')
+        if state == 'acquired':
+            break
+        if state != 'busy' or time.monotonic() >= deadline:
+            raise RuntimeError(f'Cannot acquire Arch session: {state or report.get("reason", "unknown error")}')
+        time.sleep(.25)
+
+    done = threading.Event()
+
+    def heartbeat():
+        while not done.wait(15):
+            try:
+                response = api('session-renew', token=token)
+                if response.get('session_status') != 'renewed':
+                    raise RuntimeError('session lease expired')
+            except Exception as error:
+                if not done.is_set():
+                    print(f'termux-arch: session renewal failed: {error}', file=sys.stderr)
+                # A live SSH connection also prevents idle shutdown.
+
+    thread = threading.Thread(target=heartbeat, name='arch-session-lease', daemon=True)
+    thread.start()
+    try:
+        yield
+    finally:
+        done.set()
+        thread.join(timeout=1)
+        try:
+            report = api('session-release', token=token)
+            if report.get('session_status') != 'released':
+                raise RuntimeError(report.get('reason', 'session release was not acknowledged'))
+            closing_connection_deadline = time.monotonic() + 2
+            deadline = time.monotonic() + 18
+            while report.get('running') and not report.get('suspended'):
+                if report.get('active_sessions', 0):
+                    break  # Another tracked session owns the guest.
+                if report.get('ssh_connections', 0) and time.monotonic() >= closing_connection_deadline:
+                    break  # A raw SSH connection still owns the guest.
+                if report.get('idle_error') or report.get('reason'):
+                    raise RuntimeError(report.get('idle_error') or report['reason'])
+                if time.monotonic() >= deadline:
+                    raise TimeoutError('idle transition did not finish; inspect termux-arch-vm --status')
+                time.sleep(.25)
+                report = api('status')
+        except Exception as error:
+            # Cleanup errors must not replace the guest command's exit status.
+            print(f'termux-arch: automatic idle cleanup: {error}', file=sys.stderr)
+
+
+def run_ssh(invocation):
+    previous = {}
+
+    def interrupted(number, _frame):
+        raise SystemExit(128 + number)
+
+    for number in (signal.SIGTERM, signal.SIGHUP):
+        previous[number] = signal.signal(number, interrupted)
+    child = None
+    try:
+        child = subprocess.Popen(invocation)
+        try:
+            status = child.wait()
+            return status if status >= 0 else 128 - status
+        except BaseException:
+            if child.poll() is None:
+                child.terminate()
+                try:
+                    child.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    child.kill()
+                    child.wait()
+            raise
+    finally:
+        for number, handler in previous.items():
+            signal.signal(number, handler)
+
+
+def ensure_ready(key, memory=None):
+    if memory is not None:
+        current = api('status')
+        if current.get('memory_configurable') is not True:
+            raise RuntimeError('The API does not report configurable RAM; update Termux:API or check Shizuku access')
+        if current.get('running') and current.get('memory_mib') != memory:
+            raise RuntimeError('RAM change requires a clean stop: run termux-arch-vm --stop, then retry')
+    report = api('start', key, memory) if memory is not None else api('start', key)
+    deadline = time.monotonic() + 60
+    while report.get('status') in ('starting', 'booting'):
+        if time.monotonic() >= deadline:
+            raise TimeoutError('Arch did not become ready in 60 seconds; inspect termux-arch-vm --status')
+        time.sleep(0.25)
+        report = api('status')
+    if report.get('status') != 'ready' or not report.get('running'):
+        if report.get('reason') == 'memory_change_requires_stop':
+            raise RuntimeError('RAM change requires a clean stop: run termux-arch-vm --stop, then retry')
+        raise RuntimeError(f"Arch is not ready: {report.get('reason') or report.get('status')}")
+    if memory is not None and report.get('memory_mib') != memory:
+        raise RuntimeError('API did not apply requested RAM; refusing to execute the guest command')
+    if report.get('memory_preference_error'):
+        print('termux-arch: warning: ' + report['memory_preference_error'], file=sys.stderr)
+    if report.get('vm_name') != 'termux-arch-v2' or not isinstance(report.get('ssh_port'), int):
+        raise RuntimeError('API does not provide the expected Arch SSH endpoint')
+    if not 1 <= report['ssh_port'] <= 65535:
+        raise RuntimeError('Invalid SSH endpoint port')
+    public_key(report.get('ssh_host_key', ''))
+    return report
+
+
+def pin_host(directory, key):
+    fd = os.open(directory / 'setup.lock', os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(fd, 'w') as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        return _pin_host(directory, key)
+
+
+def _pin_host(directory, key):
+    expected = f'termux-arch-v2 {public_key(key)}\n'
+    path = directory / 'known_hosts'
+    try:
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    except FileExistsError:
+        if path.is_symlink() or path.read_text() != expected:
+            raise RuntimeError('Arch SSH host key changed; inspect the guest before replacing known_hosts')
+    else:
+        with os.fdopen(fd, 'w') as stream:
+            stream.write(expected)
+    return path
+
+
+def remote_command(cwd, command):
+    if not cwd.startswith('/') or '\0' in cwd:
+        raise ValueError('--cwd must be an absolute guest path')
+    if any('\0' in arg for arg in command):
+        raise ValueError('Command arguments cannot contain NUL')
+    return 'cd -- ' + shlex.quote(cwd) + ' && exec ' + shlex.join(command or ['/bin/bash', '-l'])
+
+
+def ssh_command(identity, known, port, cwd, command, tty):
+    return ['ssh', '-F', '/dev/null', '-i', str(identity), '-p', str(port),
+            '-o', 'BatchMode=yes', '-o', 'IdentitiesOnly=yes', '-o', 'IdentityAgent=none',
+            '-o', 'StrictHostKeyChecking=yes', '-o', f'UserKnownHostsFile="{known}"',
+            '-o', 'GlobalKnownHostsFile=/dev/null', '-o', 'HostKeyAlias=termux-arch-v2',
+            '-o', 'ConnectTimeout=5', '-o', 'ServerAliveInterval=15', '-o', 'ServerAliveCountMax=3',
+            '-o', 'ClearAllForwardings=yes', '-o', 'EscapeChar=none', '-tt' if tty else '-T',
+            'root@127.0.0.1', remote_command(cwd, command)]
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__, epilog='Guest paths only; Android project directories are not shared.')
+    parser.add_argument('--cwd', help='Absolute path inside Arch (home is /root)')
+    parser.add_argument('--shell', action='store_true', help='Open a login shell in the guest home')
+    parser.add_argument('--start', action='store_true', help='Start the VM, wait for readiness and print JSON status')
+    parser.add_argument('--memory', type=memory_mib, metavar='SIZE',
+                        help='Guest RAM ceiling (8G, 8192M or MiB); saved after successful boot. Changes require a stopped VM.')
+    parser.add_argument('--keep-memory', action='store_true',
+                        help='Suspend instead of shutting down after the last session; retains guest RAM and processes')
+    parser.add_argument('--tty', action='store_true', help='Allocate a guest PTY for a command')
+    parser.add_argument('command', nargs=argparse.REMAINDER)
+    args = parser.parse_args(argv)
+    command = args.command
+    if command and command[0] == '--':
+        command = command[1:]
+    if args.shell and command:
+        parser.error('--shell does not accept a command')
+    if args.start and args.keep_memory:
+        parser.error('--keep-memory requires a shell or command, not --start')
+    if args.start and (command or args.shell):
+        parser.error('--start does not accept --shell or a guest command')
+    cwd = args.cwd
+    if cwd is None:
+        if command and Path.cwd() != Path.home():
+            parser.error('Host directories are not shared. Pass --cwd /root or another guest path.')
+        cwd = '/root'
+    remote_command(cwd, command)  # Validate before starting the VM.
+    for program in ('ssh', 'ssh-keygen'):
+        if shutil.which(program) is None:
+            raise RuntimeError('Install the openssh package in Termux first')
+    directory = Path.home() / '.config/termux/arch-vm'
+    identity, key = credentials(directory)
+    if args.start:
+        print(json.dumps(ensure_ready(key, args.memory), indent=2))
+        return 0
+    with vm_session(args.keep_memory):
+        report = ensure_ready(key, args.memory)
+        known = pin_host(directory, report['ssh_host_key'])
+        invocation = ssh_command(identity, known, report['ssh_port'], cwd, command, args.tty or not command)
+        # Do not retry a failed SSH command: it may already have changed guest files.
+        return run_ssh(invocation)
+
+
+if __name__ == '__main__':
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        sys.exit(130)
+    except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as error:
+        print(f'termux-arch: {error}', file=sys.stderr)
+        sys.exit(1)

@@ -1,0 +1,7 @@
+#!@TERMUX_PREFIX@/bin/sh
+# Consume only this host option; all guest argv remains literal after --.
+if [ "${1-}" = --keep-memory ]; then
+    shift
+    exec "@TERMUX_PREFIX@/bin/termux-arch" --keep-memory -- "$@"
+fi
+exec "@TERMUX_PREFIX@/bin/termux-arch" -- "$@"

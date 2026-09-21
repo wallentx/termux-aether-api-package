@@ -1,0 +1,38 @@
+#!@TERMUX_PREFIX@/bin/python
+"""Download and verify the Pacman suite, then perform a protected upgrade."""
+import argparse
+import hashlib
+from pathlib import Path
+import subprocess
+import tempfile
+import urllib.request
+
+parser = argparse.ArgumentParser(description=__doc__)
+parser.add_argument('--check', action='store_true', help='validate without installing')
+parser.add_argument('--adopt-legacy', action='store_true', help='back up/adopt known manually installed Aether commands')
+args = parser.parse_args()
+base = 'https://github.com/wallentx/termux-aether-app/releases/latest/download/'
+cache = Path.home() / '.cache/termux-aether'
+cache.mkdir(parents=True, exist_ok=True)
+with tempfile.TemporaryDirectory(prefix='download-', dir=cache) as temporary:
+    destination = Path(temporary)
+    for name in ('termux-aether-suite-aarch64.pkg.tar.xz', 'aether-install.py'):
+        path = destination / name
+        print('Downloading ' + name + '...', flush=True)
+        with urllib.request.urlopen(base + name, timeout=120) as response, path.open('wb') as output:
+            while chunk := response.read(1024 * 1024):
+                output.write(chunk)
+        with urllib.request.urlopen(base + name + '.sha256', timeout=60) as response:
+            checksum_text = response.read(1024).decode()
+        with path.open('rb') as stream:
+            digest = hashlib.file_digest(stream, 'sha256').hexdigest()
+        if checksum_text.split() != [digest, name]:
+            raise SystemExit('Checksum mismatch: ' + name + '; nothing installed')
+        Path(str(path) + '.sha256').write_text(checksum_text)
+    command = ['@TERMUX_PREFIX@/bin/python', str(destination / 'aether-install.py'),
+               str(destination / 'termux-aether-suite-aarch64.pkg.tar.xz')]
+    if args.check:
+        command.append('--check')
+    if args.adopt_legacy:
+        command.append('--adopt-legacy')
+    subprocess.run(command, check=True)

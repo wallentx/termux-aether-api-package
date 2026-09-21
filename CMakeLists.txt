@@ -13,6 +13,7 @@ target_link_libraries(termux-api-broadcast termux-api-static)
 
 # TODO: get list through regex or similar
 set(script_files
+  scripts/aether-update
   scripts/termux-api-start
   scripts/termux-api-stop
   scripts/termux-audio-info
@@ -21,6 +22,14 @@ set(script_files
   scripts/termux-call-log
   scripts/termux-camera-info
   scripts/termux-camera-photo
+  scripts/termux-capabilities
+  scripts/termux-arch-vm
+  scripts/termux-arch
+  scripts/termux-arch-share
+  scripts/termux-arch-resources
+  scripts/Æ
+  scripts/æ
+  scripts/termux-virtualization
   scripts/termux-clipboard-get
   scripts/termux-clipboard-set
   scripts/termux-contact-list
@@ -51,6 +60,7 @@ set(script_files
   scripts/termux-saf-write
   scripts/termux-sensor
   scripts/termux-share
+  scripts/termux-shizuku
   scripts/termux-sms-inbox
   scripts/termux-sms-list
   scripts/termux-sms-send
@@ -98,7 +108,7 @@ install(
 INSTALL(CODE "execute_process( \
   COMMAND ${CMAKE_COMMAND} -E create_symlink \
   termux-api-broadcast \
-  ${CMAKE_INSTALL_PREFIX}/libexec/termux-api \
+  \$ENV{DESTDIR}${CMAKE_INSTALL_PREFIX}/libexec/termux-api \
   )"
 )
 
