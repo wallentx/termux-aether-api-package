@@ -79,5 +79,11 @@ and [SSHFS passive transport](https://github.com/libfuse/sshfs/blob/master/sshfs
 ## Native Pacman package
 
 On aarch64 Termux, run `python3 packaging/package.py` to build without installing.
-The package is written to `build/packages/`. `VERSION` owns the release version.
+The package is written to `build/packages/`. `VERSION` owns the release version; `PKGREL` increments packaging-only revisions.
 Use the suite installer for upgrades so the preload remains available throughout the transaction.
+
+For the combined Pacman suite, use `aether-update` (or `--check` to validate only).
+Use `aether-update --adopt-legacy` once if older Aether commands were installed
+manually. The helper backs up only recognized unowned commands; it never uses a
+wildcard overwrite. APK confirmation remains separate with `aether-apks api` and
+`aether-apks app`.

@@ -18,6 +18,9 @@ def main():
     if subprocess.check_output(['uname', '-m'], text=True).strip() != 'aarch64' or not Path('/system/bin/app_process').exists():
         raise SystemExit('Build this package in native aarch64 Termux.')
     version = (ROOT / 'VERSION').read_text().strip()
+    pkgrel = int((ROOT / 'PKGREL').read_text().strip())
+    if pkgrel < 1:
+        raise SystemExit('PKGREL must be positive')
     if not re.fullmatch(r'\d+\.\d+\.\d+', version):
         raise SystemExit('VERSION must contain major.minor.patch')
     build = ROOT / 'build/aether'
@@ -36,7 +39,7 @@ def main():
         size = sum(p.stat().st_size for p in stage.rglob('*') if p.is_file() and not p.is_symlink())
         metadata = [
             'pkgname = termux-aether-api', 'pkgbase = termux-aether-api',
-            f'pkgver = 1:{version}-1', 'pkgdesc = Termux-Aether API and Arch VM commands',
+            f'pkgver = 1:{version}-{pkgrel}', 'pkgdesc = Termux-Aether API and Arch VM commands',
             'url = https://github.com/wallentx/termux-aether-api-package',
             f'builddate = {int(time.time())}', 'packager = wallentx <william.allentx@gmail.com>',
             f'size = {size}', 'arch = aarch64', 'license = MIT',
@@ -46,7 +49,7 @@ def main():
             'optdepend = rclone: host directory sharing with the Arch guest',
         ]
         (stage / '.PKGINFO').write_text('\n'.join(metadata) + '\n')
-        archive = output / f'termux-aether-api-{version}-1-aarch64.pkg.tar.xz'
+        archive = output / f'termux-aether-api-{version}-{pkgrel}-aarch64.pkg.tar.xz'
         def owner(info):
             info.uid = info.gid = 0
             info.uname = info.gname = 'root'
