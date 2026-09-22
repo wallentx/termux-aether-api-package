@@ -75,6 +75,13 @@ shared storage does not provide the same Unix metadata/symlink/execution
 semantics as guest ext4. Keep build trees on ext4, and use the SSHFS command
 below for private Termux home/project folders. No Virtio-FS speedup is claimed.
 
+With the share enabled and Arch stopped, run
+`python tests/device_arch_storage.py` from this checkout on the Pixel. It checks
+bidirectional writes/rename, suspend/resume, automatic unmount/shutdown, restart
+persistence, and disable/re-enable without deleting shared files. It uses a
+unique temporary fixture, restores the configured share, and never force-stops
+a VM. A failed run retains its fixture and `~/arch-storage-results.json`.
+
 ### Private project sharing over SSHFS
 
 Install `rclone` in Termux and `sshfs` in Arch, then run:
