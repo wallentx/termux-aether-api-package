@@ -49,7 +49,33 @@ RAM-state retention and network recovery. Start with a stopped guest; the test
 refuses to disrupt an existing VM and never force-stops it. Results default to
 `~/arch-lifecycle-results.json`.
 
-### Live project sharing
+### Android shared storage over Virtio-FS
+
+With the updated API, Virtio-FS guest kernel and guest helpers installed, stop
+Arch and opt in once:
+
+```sh
+termux-arch-vm --stop
+termux-arch-vm --share-enable
+termux-arch --cwd /mnt/android -- ls
+```
+
+This creates/exports `/storage/emulated/0/Download/AetherShared` at `/mnt/android`.
+Pass another existing or new Android shared-storage folder as the argument to
+`--share-enable` to select it instead. The setting persists across `Æ`/`æ`
+sessions; the folder is mounted during boot, flushed/unmounted during shutdown,
+and retained with the VM when `--keep-memory` requests suspension. An enabled
+share does not keep an otherwise idle VM running. `--status` reports configured
+paths, actual mount state and errors. A failed mount prevents normal readiness.
+
+Run `termux-arch-vm --share-disable` while stopped to disable the next export.
+Neither disabling nor shutting down deletes shared files. Both sides can read
+and write the selected folder. The mount uses `nodev,nosuid,noexec`; Android
+shared storage does not provide the same Unix metadata/symlink/execution
+semantics as guest ext4. Keep build trees on ext4, and use the SSHFS command
+below for private Termux home/project folders. No Virtio-FS speedup is claimed.
+
+### Private project sharing over SSHFS
 
 Install `rclone` in Termux and `sshfs` in Arch, then run:
 

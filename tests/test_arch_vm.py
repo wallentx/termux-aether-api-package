@@ -43,6 +43,15 @@ class ArchVmCliTest(unittest.TestCase):
         self.assertEqual(0, self.invoke("--help").returncode)
         self.assertFalse(self.marker.exists())
 
+    def test_shared_storage_delegation_preserves_folder_argument(self):
+        launcher = self.prefix / 'bin/termux-arch-resources'
+        launcher.write_text('#!/bin/sh\nprintf \'%s\\n\' "$@" > "' + str(self.marker) + '"\n')
+        launcher.chmod(0o700)
+        for args in (('--share-enable',), ('--share-enable', '/storage/emulated/0/My Folder;false'),
+                     ('--share-disable',)):
+            self.assertEqual(0, self.invoke(*args).returncode)
+            self.assertEqual(list(args), self.marker.read_text().splitlines())
+
     def test_memory_forwarding_preserves_argument_boundaries(self):
         launcher = self.prefix / 'bin/termux-arch'
         launcher.write_text('#!/bin/sh\nprintf \'%s\\n\' "$@" > "' + str(self.marker) + '"\n')
