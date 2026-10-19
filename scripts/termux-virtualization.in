@@ -1,0 +1,26 @@
+#!@TERMUX_PREFIX@/bin/sh
+set -eu
+
+usage() {
+    echo 'Usage: termux-virtualization [--status] [--json]'
+    echo 'Read AVF features, app permissions, framework access and custom Linux VM blockers.'
+    echo 'No VM is started and no permission is granted. JSON is the default.'
+}
+
+status=false
+json=false
+for argument in "$@"; do
+    case "$argument" in
+        -h|--help) usage; exit 0 ;;
+        --status)
+            if "$status"; then echo 'termux-virtualization: repeated --status' >&2; exit 2; fi
+            status=true ;;
+        --json)
+            if "$json"; then echo 'termux-virtualization: repeated --json' >&2; exit 2; fi
+            json=true ;;
+        *) echo "termux-virtualization: unknown option: $argument" >&2; exit 2 ;;
+    esac
+done
+
+exec "@TERMUX_PREFIX@/bin/timeout" --foreground 20 \
+    "@TERMUX_PREFIX@/libexec/termux-api" Virtualization --es operation status

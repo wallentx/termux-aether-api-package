@@ -1,0 +1,10 @@
+#!@TERMUX_PREFIX@/bin/sh
+# Use the configured guest user/directory; keep guest argv literal after --.
+case "${1-}" in
+    --keep-memory|--no-keep-memory)
+        lifecycle_option=$1
+        shift
+        exec "@TERMUX_PREFIX@/bin/termux-arch" "$lifecycle_option" -- "$@"
+        ;;
+esac
+exec "@TERMUX_PREFIX@/bin/termux-arch" -- "$@"

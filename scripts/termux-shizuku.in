@@ -1,0 +1,28 @@
+#!@TERMUX_PREFIX@/bin/sh
+set -eu
+
+usage() {
+    echo 'Usage: termux-shizuku [--status|--request-permission|--thermal] [--json]'
+    echo 'Show Shizuku status, open its permission UI, or read current thermal sensors.'
+    echo 'JSON is the default. Thermal reads require explicit Shizuku authorization.'
+}
+
+operation=status
+selected=false
+json=false
+for argument in "$@"; do
+    case "$argument" in
+        -h|--help) usage; exit 0 ;;
+        --json)
+            if "$json"; then echo 'termux-shizuku: repeated --json' >&2; exit 2; fi
+            json=true ;;
+        --status|--request-permission|--thermal)
+            if "$selected"; then echo 'termux-shizuku: choose one operation' >&2; exit 2; fi
+            selected=true
+            operation=${argument#--} ;;
+        *) echo "termux-shizuku: unknown option: $argument" >&2; exit 2 ;;
+    esac
+done
+
+exec "@TERMUX_PREFIX@/bin/timeout" --foreground 20 \
+    "@TERMUX_PREFIX@/libexec/termux-api" Shizuku --es operation "$operation"

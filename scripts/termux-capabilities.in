@@ -1,0 +1,23 @@
+#!@TERMUX_PREFIX@/bin/sh
+set -eu
+
+usage() {
+    echo 'Usage: termux-capabilities [--json]'
+    echo 'Read device, CPU, permission, battery, thermal and Shizuku status as JSON.'
+    echo 'Requires the matching Termux:API fork. Does not request permissions.'
+}
+
+case "${1-}" in
+    -h|--help) usage; exit 0 ;;
+    --json) shift ;;
+    '') ;;
+    *) echo "termux-capabilities: unknown option: $1" >&2; exit 2 ;;
+esac
+if [ "$#" -ne 0 ]; then
+    echo 'termux-capabilities: unexpected arguments' >&2
+    exit 2
+fi
+
+# Legacy API transport can wait indefinitely when the companion app is unavailable.
+exec "@TERMUX_PREFIX@/bin/timeout" --foreground 15 \
+    "@TERMUX_PREFIX@/libexec/termux-api" Capabilities
