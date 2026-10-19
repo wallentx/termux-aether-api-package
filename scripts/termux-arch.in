@@ -1,7 +1,7 @@
 #!@TERMUX_PREFIX@/bin/python
 """Open the persistent Arch AVF guest using authenticated SSH over vsock."""
 import argparse
-from contextlib import contextmanager
+from contextlib import contextmanager, ExitStack
 from decimal import Decimal, InvalidOperation
 import base64
 import fcntl
@@ -21,6 +21,106 @@ import threading
 import uuid
 
 PREFIX = '@TERMUX_PREFIX@'
+DEFAULT_CONFIG = {'user': 'root', 'cwd': None, 'memory': None, 'graphics_mode': None,
+                  'keep_memory': False, 'tty': None}
+CONFIG_TEMPLATE = '''# Default execution account inside Arch; the account must already exist.
+user: root
+# null starts in the selected guest user's home; otherwise use an absolute guest path.
+cwd: null
+# null keeps the VM's saved RAM size; examples: 8G, 8192M, 8192 (MiB).
+memory: null
+# null reuses an existing VM's mode and starts new VMs headless.
+# gfxstream enables the GPU on each boot; none explicitly requests headless.
+graphics_mode: null
+# Retain guest RAM/processes after the last session instead of shutting down.
+keep_memory: false
+# null chooses automatically: true for a shell, false for a command.
+tty: null
+'''
+
+
+def config_path():
+    xdg = os.environ.get('XDG_CONFIG_HOME', '')
+    base = Path(xdg) if xdg and Path(xdg).is_absolute() else Path.home() / '.config'
+    return base / 'termux-arch/config.yml'
+
+
+def execution_user(value):
+    if not isinstance(value, str) or not re.fullmatch(r'[A-Za-z_][A-Za-z0-9_.-]{0,255}\$?', value):
+        raise ValueError('user must be a guest account name such as root or alarm')
+    return value
+
+
+def unique_mapping(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f'Duplicate config key: {key}')
+        result[key] = value
+    return result
+
+
+def load_config():
+    path = config_path()
+    path.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
+    # Termux forbids hard links. Serialize creation/read and create exclusively so
+    # another launcher cannot read a partial file or overwrite an existing config.
+    lock = os.open(path.parent / '.config.lock', os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(lock, 'w') as lock_stream:
+        fcntl.flock(lock_stream, fcntl.LOCK_EX)
+        try:
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        except FileExistsError:
+            pass
+        else:
+            with os.fdopen(fd, 'w') as stream:
+                stream.write(CONFIG_TEMPLATE)
+                stream.flush()
+                os.fsync(stream.fileno())
+        if not path.is_file():
+            raise ValueError(f'Config must be a regular YAML file: {path}')
+        with path.open('rb') as stream:
+            raw = stream.read(65537)
+    if len(raw) > 65536:
+        raise ValueError(f'Config exceeds 64 KiB: {path}')
+    yq = shutil.which('yq')
+    if yq is None:
+        raise RuntimeError('Install yq (version 4) to read the termux-arch YAML config')
+    parsed = subprocess.run([yq, '-p=yaml', '-o=json', '-I=0', '.'], input=raw,
+                            capture_output=True, timeout=5)
+    if parsed.returncode:
+        raise ValueError(f'Invalid YAML config {path}: {parsed.stderr.decode(errors="replace").strip()}')
+    try:
+        values = json.loads(parsed.stdout, object_pairs_hook=unique_mapping)
+    except (ValueError, UnicodeError) as error:
+        raise ValueError(f'Invalid YAML config {path}: {error}') from error
+    if values is None:
+        values = {}
+    if not isinstance(values, dict):
+        raise ValueError(f'Config must contain a mapping of settings: {path}')
+    unknown = values.keys() - DEFAULT_CONFIG.keys()
+    if unknown:
+        raise ValueError('Unknown config settings: ' + ', '.join(sorted(unknown)))
+    result = dict(DEFAULT_CONFIG, **values)
+    execution_user(result['user'])
+    cwd = result['cwd']
+    if cwd is not None and (not isinstance(cwd, str) or not cwd.startswith('/') or '\0' in cwd):
+        raise ValueError('cwd must be null (guest home) or an absolute guest path')
+    if type(result['keep_memory']) is not bool:
+        raise ValueError('keep_memory must be true or false')
+    if result['tty'] is not None and type(result['tty']) is not bool:
+        raise ValueError('tty must be null, true or false')
+    if result['graphics_mode'] not in (None, 'none', 'gfxstream'):
+        raise ValueError('graphics_mode must be null, none or gfxstream')
+    memory = result['memory']
+    if memory is not None:
+        if type(memory) not in (str, int):
+            raise ValueError('memory must be null, a size such as 8G, or an integer number of MiB')
+        try:
+            memory_mib(str(memory))
+        except argparse.ArgumentTypeError as error:
+            raise ValueError(f'Invalid config memory: {error}') from error
+    return result
 
 
 def memory_mib(value):
@@ -74,7 +174,8 @@ def credentials(directory):
         return identity, key
 
 
-def api(operation, key=None, memory=None, *, token=None, keep_memory=False, disk_bytes=None, shared_path=None):
+def api(operation, key=None, memory=None, *, token=None, keep_memory=False, disk_bytes=None,
+        shared_path=None, graphics_mode=None):
     command = [f'{PREFIX}/bin/timeout', '--foreground', '20', f'{PREFIX}/libexec/termux-api',
                'Virtualization', '--es', 'operation', 'arch-' + operation]
     if key is not None:
@@ -87,10 +188,41 @@ def api(operation, key=None, memory=None, *, token=None, keep_memory=False, disk
         command += ['--es', 'disk_bytes', str(disk_bytes)]
     if shared_path is not None:
         command += ['--es', 'shared_path', shared_path]
+    if graphics_mode is not None:
+        command += ['--es', 'graphics_mode', graphics_mode]
     result = subprocess.run(command, capture_output=True, text=True, timeout=22)
     if result.returncode:
         raise RuntimeError(f'VM API transport failed ({result.returncode}): {result.stderr.strip()}')
     return json.loads(result.stdout)
+
+
+def check_api_access(report, *, allow_boot_error=False):
+    if not isinstance(report, dict):
+        raise RuntimeError('VM API returned an invalid response')
+    status = report.get('status')
+    reason = report.get('reason')
+    # A full status report can retain a failed boot; a new start may retry it.
+    previous_boot_error = (allow_boot_error and report.get('vm_name') == 'termux-arch-v2'
+                           and report.get('running') is False)
+    if (status in ('denied', 'unavailable') or (status == 'unsupported' and reason)
+            or (status == 'error' and not previous_boot_error)):
+        if reason == 'memory_change_requires_stop':
+            raise RuntimeError('RAM change requires a clean stop: run termux-arch-vm --stop, then retry')
+        if reason == 'graphics_change_requires_stop':
+            raise RuntimeError('Graphics change requires a clean stop: run termux-arch-vm --stop, then retry')
+        detail = reason or report.get('error') or ('Shizuku access is not authorized' if status == 'denied'
+                                                  else 'check Termux:API and Shizuku access')
+        raise RuntimeError(f'VM API {status}: {detail}')
+
+
+@contextmanager
+def startup_lock(directory):
+    # All supported launchers share this lock, including launches with no explicit
+    # graphics setting. Raw API callers must coordinate separately.
+    fd = os.open(directory / 'startup.lock', os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(fd, 'w') as stream:
+        fcntl.flock(stream, fcntl.LOCK_EX)
+        yield
 
 
 @contextmanager
@@ -99,6 +231,7 @@ def vm_session(keep_memory=False):
     deadline = time.monotonic() + 30
     while True:
         report = api('session-acquire', token=token, keep_memory=keep_memory)
+        check_api_access(report)
         if report.get('session_lifecycle') is not True:
             raise RuntimeError('Update Termux:API for automatic Arch session cleanup')
         state = report.get('session_status')
@@ -178,26 +311,49 @@ def run_ssh(invocation):
             signal.signal(number, handler)
 
 
-def ensure_ready(key, memory=None):
+def check_preferences(memory=None, graphics_mode=None):
+    if memory is None and graphics_mode is None:
+        return
+    current = api('status')
+    check_api_access(current, allow_boot_error=True)
     if memory is not None:
-        current = api('status')
         if current.get('memory_configurable') is not True:
             raise RuntimeError('The API does not report configurable RAM; update Termux:API or check Shizuku access')
         if current.get('running') and current.get('memory_mib') != memory:
             raise RuntimeError('RAM change requires a clean stop: run termux-arch-vm --stop, then retry')
-    report = api('start', key, memory) if memory is not None else api('start', key)
+    if graphics_mode is not None:
+        if current.get('graphics_configurable') is not True:
+            raise RuntimeError('The API does not report configurable graphics; update Termux:API')
+        if type(current.get('running')) is not bool:
+            raise RuntimeError('API did not report whether the VM is running; refusing to change graphics')
+        if current['running']:
+            if current.get('graphics_mode') != graphics_mode:
+                raise RuntimeError('Graphics change requires a clean stop: run termux-arch-vm --stop, then retry')
+        elif graphics_mode == 'gfxstream' and current.get('graphics_kernel_present') is not True:
+            raise RuntimeError('The Gfxstream kernel is missing; install Image-gfxstream before enabling GPU graphics')
+
+
+def ensure_ready(key, memory=None, graphics_mode=None, *, prechecked=False):
+    if not prechecked:
+        check_preferences(memory, graphics_mode)
+    options = {} if graphics_mode is None else {'graphics_mode': graphics_mode}
+    report = api('start', key, memory, **options) if memory is not None else api('start', key, **options)
+    check_api_access(report)
     deadline = time.monotonic() + 60
     while report.get('status') in ('starting', 'booting'):
         if time.monotonic() >= deadline:
             raise TimeoutError('Arch did not become ready in 60 seconds; inspect termux-arch-vm --status')
         time.sleep(0.25)
         report = api('status')
+        check_api_access(report)
     if report.get('status') != 'ready' or not report.get('running'):
         if report.get('reason') == 'memory_change_requires_stop':
             raise RuntimeError('RAM change requires a clean stop: run termux-arch-vm --stop, then retry')
         raise RuntimeError(f"Arch is not ready: {report.get('reason') or report.get('status')}")
     if memory is not None and report.get('memory_mib') != memory:
         raise RuntimeError('API did not apply requested RAM; refusing to execute the guest command')
+    if graphics_mode is not None and report.get('graphics_mode') != graphics_mode:
+        raise RuntimeError('API did not apply requested graphics mode; refusing to execute the guest command')
     if report.get('memory_preference_error'):
         print('termux-arch: warning: ' + report['memory_preference_error'], file=sys.stderr)
     if report.get('vm_name') != 'termux-arch-v2' or not isinstance(report.get('ssh_port'), int):
@@ -206,6 +362,20 @@ def ensure_ready(key, memory=None):
         raise RuntimeError('Invalid SSH endpoint port')
     public_key(report.get('ssh_host_key', ''))
     return report
+
+
+@contextmanager
+def ready_vm(directory, key, *, keep_memory=False, memory=None, graphics_mode=None, managed=True):
+    """Start/reuse a compatible VM, retaining an optional lease for the caller."""
+    with ExitStack() as session:
+        with startup_lock(directory):
+            # Acquiring a lease adopts the VM's idle policy. Reject incompatible
+            # existing VMs before acquisition so failures leave them untouched.
+            check_preferences(memory, graphics_mode)
+            if managed:
+                session.enter_context(vm_session(keep_memory))
+            report = ensure_ready(key, memory, graphics_mode, prechecked=True)
+        yield report
 
 
 def pin_host(directory, key):
@@ -229,34 +399,52 @@ def _pin_host(directory, key):
     return path
 
 
-def remote_command(cwd, command):
-    if not cwd.startswith('/') or '\0' in cwd:
+def remote_command(cwd, command, user='root'):
+    execution_user(user)
+    if cwd is not None and (not isinstance(cwd, str) or not cwd.startswith('/') or '\0' in cwd):
         raise ValueError('--cwd must be an absolute guest path')
     if any('\0' in arg for arg in command):
         raise ValueError('Command arguments cannot contain NUL')
-    return 'cd -- ' + shlex.quote(cwd) + ' && exec ' + shlex.join(command or ['/bin/bash', '-l'])
+    argv = command or ['/bin/bash', '-l']
+    if user == 'root':
+        directory = '"$HOME"' if cwd is None else shlex.quote(cwd)
+        return 'cd -- ' + directory + ' && exec ' + shlex.join(argv)
+    # Root SSH is bootstrapped by the VM. Drop identity before cd/exec, without
+    # enabling SSH access for other accounts or interpreting their command argv.
+    script = 'cd -- "$HOME" && exec "$@"' if cwd is None else 'cd -- "$1" && shift && exec "$@"'
+    return 'exec ' + shlex.join(['/usr/bin/runuser', '--user', user, '--', '/bin/bash', '-c',
+                                script, 'termux-arch', *([] if cwd is None else [cwd]), *argv])
 
 
-def ssh_command(identity, known, port, cwd, command, tty):
+def ssh_command(identity, known, port, cwd, command, tty, user='root'):
     return ['ssh', '-F', '/dev/null', '-i', str(identity), '-p', str(port),
             '-o', 'BatchMode=yes', '-o', 'IdentitiesOnly=yes', '-o', 'IdentityAgent=none',
             '-o', 'StrictHostKeyChecking=yes', '-o', f'UserKnownHostsFile="{known}"',
             '-o', 'GlobalKnownHostsFile=/dev/null', '-o', 'HostKeyAlias=termux-arch-v2',
             '-o', 'ConnectTimeout=5', '-o', 'ServerAliveInterval=15', '-o', 'ServerAliveCountMax=3',
             '-o', 'ClearAllForwardings=yes', '-o', 'EscapeChar=none', '-tt' if tty else '-T',
-            'root@127.0.0.1', remote_command(cwd, command)]
+            'root@127.0.0.1', remote_command(cwd, command, user)]
 
 
-def main(argv=None):
-    parser = argparse.ArgumentParser(description=__doc__, epilog='Guest paths only; Android project directories are not shared.')
-    parser.add_argument('--cwd', help='Absolute path inside Arch (home is /root)')
+def parse_options(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__,
+        epilog=f'Defaults: {config_path()}. Guest paths only; host cwd is not forwarded.')
+    parser.add_argument('--user', help='Guest execution user (overrides config)')
+    parser.add_argument('--cwd', help='Absolute guest working directory (default: configured path or guest user home)')
     parser.add_argument('--shell', action='store_true', help='Open a login shell in the guest home')
     parser.add_argument('--start', action='store_true', help='Start the VM, wait for readiness and print JSON status')
     parser.add_argument('--memory', type=memory_mib, metavar='SIZE',
                         help='Guest RAM ceiling (8G, 8192M or MiB); saved after successful boot. Changes require a stopped VM.')
-    parser.add_argument('--keep-memory', action='store_true',
+    parser.add_argument('--graphics-mode', choices=('none', 'gfxstream'),
+                        help='Guest graphics mode (overrides config); changes require a stopped VM')
+    lifecycle = parser.add_mutually_exclusive_group()
+    lifecycle.add_argument('--keep-memory', action='store_true', default=None,
                         help='Suspend instead of shutting down after the last session; retains guest RAM and processes')
-    parser.add_argument('--tty', action='store_true', help='Allocate a guest PTY for a command')
+    lifecycle.add_argument('--no-keep-memory', dest='keep_memory', action='store_false',
+                           help='Release guest RAM after the last session, overriding config')
+    terminal = parser.add_mutually_exclusive_group()
+    terminal.add_argument('--tty', action='store_true', default=None, help='Allocate a guest PTY')
+    terminal.add_argument('--no-tty', dest='tty', action='store_false', help='Do not allocate a guest PTY')
     parser.add_argument('command', nargs=argparse.REMAINDER)
     args = parser.parse_args(argv)
     command = args.command
@@ -268,24 +456,38 @@ def main(argv=None):
         parser.error('--keep-memory requires a shell or command, not --start')
     if args.start and (command or args.shell):
         parser.error('--start does not accept --shell or a guest command')
-    cwd = args.cwd
-    if cwd is None:
-        if command and Path.cwd() != Path.home():
-            parser.error('Host directories are not shared. Pass --cwd /root or another guest path.')
-        cwd = '/root'
-    remote_command(cwd, command)  # Validate before starting the VM.
+    try:
+        config = load_config()
+        for key in ('user', 'cwd', 'keep_memory', 'tty', 'graphics_mode'):
+            if getattr(args, key) is None:
+                setattr(args, key, config[key])
+        if args.memory is None and config['memory'] is not None:
+            args.memory = memory_mib(str(config['memory']))
+        remote_command(args.cwd, command, args.user)  # Validate before starting the VM.
+    except (OSError, ValueError, RuntimeError, argparse.ArgumentTypeError, subprocess.SubprocessError) as error:
+        parser.error(str(error))
+    args.command = command
+    if args.tty is None:
+        args.tty = not bool(command)
+    if args.start:
+        args.keep_memory = False  # Session-only config must not block the start action.
+    return args
+
+
+def main(argv=None):
+    args = parse_options(argv)
     for program in ('ssh', 'ssh-keygen'):
         if shutil.which(program) is None:
             raise RuntimeError('Install the openssh package in Termux first')
     directory = Path.home() / '.config/termux/arch-vm'
     identity, key = credentials(directory)
-    if args.start:
-        print(json.dumps(ensure_ready(key, args.memory), indent=2))
-        return 0
-    with vm_session(args.keep_memory):
-        report = ensure_ready(key, args.memory)
+    with ready_vm(directory, key, keep_memory=args.keep_memory, memory=args.memory,
+                  graphics_mode=args.graphics_mode, managed=not args.start) as report:
+        if args.start:
+            print(json.dumps(report, indent=2))
+            return 0
         known = pin_host(directory, report['ssh_host_key'])
-        invocation = ssh_command(identity, known, report['ssh_port'], cwd, command, args.tty or not command)
+        invocation = ssh_command(identity, known, report['ssh_port'], args.cwd, args.command, args.tty, args.user)
         # Do not retry a failed SSH command: it may already have changed guest files.
         return run_ssh(invocation)
 

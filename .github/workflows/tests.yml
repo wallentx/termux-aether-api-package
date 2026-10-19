@@ -17,6 +17,7 @@ jobs:
       - uses: actions/checkout@v4
       - name: Test capability command
         run: |
+          yq --version
           sh -n scripts/termux-capabilities.in
           sh -n scripts/termux-shizuku.in
           sh -n scripts/termux-virtualization.in

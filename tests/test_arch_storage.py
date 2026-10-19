@@ -62,5 +62,68 @@ class SharedStorageCli(unittest.TestCase):
         self.assertEqual(result, 1)
 
 
+class DiskGrowthCli(unittest.TestCase):
+    def invoke(self, config_memory=None, graphics_mode=None, resize_returncode=0, config_error=None):
+        arch = mock.Mock()
+        arch.api.side_effect = [
+            {'filesystem_growth_required': True},
+            {'status': 'stopped', 'running': False},
+        ]
+        arch.load_config.return_value = {'memory': config_memory, 'graphics_mode': graphics_mode,
+                                         'keep_memory': True, 'user': 'alarm', 'cwd': '/home/alarm'}
+        arch.load_config.side_effect = config_error
+        arch.memory_mib.side_effect = lambda value: {
+            '16384': 16384, '8G': 8192, '8192': 8192}[value]
+        arch.credentials.return_value = ('identity', 'key')
+        arch.ready_vm.side_effect = lambda *args, **kwargs: contextlib.nullcontext({
+            'ssh_host_key': 'host', 'ssh_port': 22})
+        arch.pin_host.return_value = 'known'
+        arch.ssh_command.return_value = ['ssh', 'resize2fs', '/dev/vda']
+        self.arch = arch
+        with mock.patch.object(resources, 'load_arch', return_value=arch), \
+             mock.patch.object(Path, 'home', return_value=Path('/host-home')), \
+             mock.patch.object(resources.subprocess, 'run',
+                               return_value=SimpleNamespace(returncode=resize_returncode)) as run, \
+             contextlib.redirect_stdout(io.StringIO()) as output:
+            result = resources.main(['--grow-disk', '16384'])
+        return result, arch, run, output.getvalue()
+
+    def test_growth_boot_applies_saved_graphics_and_memory_as_root(self):
+        for memory in ('8G', 8192):
+            with self.subTest(memory=memory):
+                result, arch, run, output = self.invoke(memory, 'gfxstream')
+                self.assertEqual(0, result)
+                arch.load_config.assert_called_once_with()
+                self.assertEqual([mock.call('16384'), mock.call(str(memory))], arch.memory_mib.call_args_list)
+                arch.ready_vm.assert_called_once_with(Path('/host-home/.config/termux/arch-vm'), 'key',
+                    memory=8192, graphics_mode='gfxstream')
+                arch.vm_session.assert_not_called()
+                arch.ensure_ready.assert_not_called()
+                arch.ssh_command.assert_called_once_with('identity', 'known', 22, '/',
+                    ['resize2fs', '/dev/vda'], False)
+                self.assertEqual(120, run.call_args.kwargs['timeout'])
+                self.assertIn('"filesystem_growth_completed": true', output)
+                self.assertEqual([mock.call('disk-grow', disk_bytes=16384 * 1024 * 1024),
+                                  mock.call('status')], arch.api.call_args_list)
+
+    def test_growth_without_saved_preferences_keeps_release_on_exit(self):
+        result, arch, _, _ = self.invoke()
+        self.assertEqual(0, result)
+        arch.ready_vm.assert_called_once_with(Path('/host-home/.config/termux/arch-vm'), 'key',
+            memory=None, graphics_mode=None)
+        arch.memory_mib.assert_called_once_with('16384')
+
+    def test_invalid_config_fails_before_capacity_changes(self):
+        with self.assertRaisesRegex(ValueError, 'Invalid config'):
+            self.invoke(config_error=ValueError('Invalid config'))
+        self.arch.api.assert_not_called()
+        self.arch.ready_vm.assert_not_called()
+
+    def test_resize_failure_is_reported_without_claiming_completion(self):
+        with self.assertRaisesRegex(RuntimeError, 'ext4 growth failed'):
+            self.invoke(resize_returncode=1)
+        self.arch.api.assert_called_once_with('disk-grow', disk_bytes=16384 * 1024 * 1024)
+
+
 if __name__ == '__main__':
     unittest.main()

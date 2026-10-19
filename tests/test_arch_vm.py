@@ -16,6 +16,9 @@ class ArchVmCliTest(unittest.TestCase):
         helper = self.prefix / "libexec/termux-api"
         helper.write_text('#!/bin/sh\nprintf \'%s\\n\' "$@" > "' + str(self.marker) + '"\n')
         helper.chmod(0o700)
+        launcher = self.prefix / 'bin/termux-arch'
+        launcher.write_text('#!/bin/sh\nprintf \'%s\\n\' "$@" > "' + str(self.marker) + '"\n')
+        launcher.chmod(0o700)
         timeout = self.prefix / "bin/timeout"
         timeout.write_text('#!/bin/sh\n[ "$1" = --foreground ] && [ "$2" = 20 ] || exit 8\nshift 2\nexec "$@"\n')
         timeout.chmod(0o700)
@@ -28,10 +31,18 @@ class ArchVmCliTest(unittest.TestCase):
 
     def test_fixed_operations_preserve_argv(self):
         for args, operation in [((), "status"), (("--status",), "status"),
-                                (("--start",), "start"), (("--stop",), "stop")]:
+                                (("--stop",), "stop")]:
             self.assertEqual(0, self.invoke(*args).returncode)
             self.assertEqual(["Virtualization", "--es", "operation", "arch-" + operation],
                              self.marker.read_text().splitlines())
+
+    def test_plain_start_uses_shared_launcher_defaults(self):
+        self.assertEqual(0, self.invoke('--start').returncode)
+        self.assertEqual(['--start'], self.marker.read_text().splitlines())
+
+    def test_start_preserves_launcher_failure(self):
+        (self.prefix / 'bin/termux-arch').write_text('#!/bin/sh\nexit 17\n')
+        self.assertEqual(17, self.invoke('--start').returncode)
 
     def test_arbitrary_commands_paths_and_multiple_operations_are_rejected(self):
         for args in (("--exec", "id"), ("--start", "--stop"), ("--start;id",),

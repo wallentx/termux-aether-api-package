@@ -55,6 +55,8 @@ def main(argv=None):
     elif args.memory_live is not None:
         result = arch.api('memory-live', memory=args.memory_live)
     else:
+        config = arch.load_config()
+        memory = None if config['memory'] is None else arch.memory_mib(str(config['memory']))
         result = arch.api('disk-grow', disk_bytes=args.grow_disk * 1024 * 1024)
         if result.get('status') == 'error' or result.get('filesystem_growth_required') is not True:
             raise RuntimeError(result.get('reason') or json.dumps(result))
@@ -62,8 +64,8 @@ def main(argv=None):
         # An interrupted resize leaves the sparse capacity available for retry.
         directory = Path.home() / '.config/termux/arch-vm'
         identity, key = arch.credentials(directory)
-        with arch.vm_session():
-            state = arch.ensure_ready(key)
+        with arch.ready_vm(directory, key, memory=memory,
+                           graphics_mode=config['graphics_mode']) as state:
             known = arch.pin_host(directory, state['ssh_host_key'])
             invocation = arch.ssh_command(identity, known, state['ssh_port'], '/', ['resize2fs', '/dev/vda'], False)
             process = subprocess.run(invocation, stdout=sys.stderr, stderr=sys.stderr, timeout=120)

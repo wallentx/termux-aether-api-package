@@ -55,7 +55,8 @@ class ShareTransportTest(unittest.TestCase):
 
 class ShareCleanupTest(unittest.TestCase):
     def run_share(self, signals=(), unmount_results=(), client_wait_errors=0,
-                  server_wait_errors=0, client_start_error=False, loop_error=False):
+                  server_wait_errors=0, client_start_error=False, loop_error=False,
+                  config_memory=None, graphics_mode=None, keep_memory=False):
         handlers = {}
         clients = []
         unmounts = []
@@ -118,10 +119,14 @@ class ShareCleanupTest(unittest.TestCase):
 
         arch = mock.Mock()
         arch.credentials.return_value = ('identity', 'key')
-        arch.vm_session.side_effect = lambda _: contextlib.nullcontext()
-        arch.ensure_ready.return_value = {'ssh_host_key': 'host', 'ssh_port': 22}
+        arch.load_config.return_value = {'memory': config_memory, 'graphics_mode': graphics_mode,
+                                         'keep_memory': True, 'user': 'alarm', 'cwd': '/home/alarm'}
+        arch.memory_mib.side_effect = lambda value: {'8G': 8192, '8192': 8192}[value]
+        arch.ready_vm.side_effect = lambda *args, **kwargs: contextlib.nullcontext({
+            'ssh_host_key': 'host', 'ssh_port': 22})
         arch.pin_host.return_value = 'known'
         arch.ssh_command.side_effect = lambda identity, known, port, cwd, command, tty: command
+        self.arch = arch
         self.children = clients
         self.unmounts = unmounts
         self.handlers = handlers
@@ -135,7 +140,8 @@ class ShareCleanupTest(unittest.TestCase):
              mock.patch.object(module.subprocess, 'Popen', side_effect=[
                  server, OSError('client launch failed') if client_start_error else client]), \
              contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
-            return module.main([directory, '/mnt/project'])
+            self.vm_directory = Path(directory) / '.config/termux/arch-vm'
+            return module.main([directory, '/mnt/project', *(['--keep-memory'] if keep_memory else [])])
 
     def assert_cleaned(self):
         server, client = self.children
@@ -211,3 +217,24 @@ class ShareCleanupTest(unittest.TestCase):
                                          [subprocess.TimeoutExpired('ssh', 20), 0]))
         self.assertEqual(2, len(self.unmounts))
         self.assert_cleaned()
+
+    def test_share_uses_shared_startup_with_saved_graphics_and_memory(self):
+        for memory in ('8G', 8192):
+            with self.subTest(memory=memory):
+                self.assertEqual(0, self.run_share([signal.SIGINT], [0],
+                    config_memory=memory, graphics_mode='gfxstream'))
+                self.arch.load_config.assert_called_once_with()
+                self.arch.memory_mib.assert_called_once_with(str(memory))
+                self.arch.ready_vm.assert_called_once_with(self.vm_directory, 'key',
+                    keep_memory=False, memory=8192, graphics_mode='gfxstream')
+                self.arch.vm_session.assert_not_called()
+                self.arch.ensure_ready.assert_not_called()
+                for invocation in self.arch.ssh_command.call_args_list:
+                    self.assertEqual(('identity', 'known', 22, '/'), invocation.args[:4])
+                    self.assertEqual({}, invocation.kwargs)
+
+    def test_share_keeps_cli_retention_policy_with_unspecified_boot_preferences(self):
+        self.assertEqual(0, self.run_share([signal.SIGINT], [0], keep_memory=True))
+        self.arch.memory_mib.assert_not_called()
+        self.arch.ready_vm.assert_called_once_with(self.vm_directory, 'key',
+            keep_memory=True, memory=None, graphics_mode=None)

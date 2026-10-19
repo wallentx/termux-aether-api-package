@@ -45,7 +45,7 @@ def main():
             f'size = {size}', 'arch = aarch64', 'license = MIT',
             f'provides = termux-api={version}', 'conflict = termux-api',
             'depend = bash', 'depend = util-linux', 'depend = termux-am>=0.8.0',
-            'depend = python', 'depend = openssh', 'depend = termux-aether-exec>=1:1000.0.0',
+            'depend = python', 'depend = openssh', 'depend = yq', 'depend = termux-aether-exec>=1:1000.0.0',
             'optdepend = rclone: host directory sharing with the Arch guest',
         ]
         (stage / '.PKGINFO').write_text('\n'.join(metadata) + '\n')

@@ -73,6 +73,8 @@ def main(argv=None):
     if shutil.which('rclone') is None:
         parser.error('Install the Termux rclone package first: pacman -S rclone')
     arch = load_arch()
+    config = arch.load_config()
+    memory = None if config['memory'] is None else arch.memory_mib(str(config['memory']))
     directory = Path.home() / '.config/termux/arch-vm'
     identity, key = arch.credentials(directory)
     cache = Path.home() / '.cache/termux/arch-shares' / hashlib.sha256(os.fsencode(local)).hexdigest()
@@ -82,8 +84,8 @@ def main(argv=None):
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
             parser.error('This directory already has an active share')
-        with arch.vm_session(args.keep_memory):
-            report = arch.ensure_ready(key)
+        with arch.ready_vm(directory, key, keep_memory=args.keep_memory, memory=memory,
+                           graphics_mode=config['graphics_mode']) as report:
             known = arch.pin_host(directory, report['ssh_host_key'])
             def ssh(command):
                 return arch.ssh_command(identity, known, report['ssh_port'], '/', command, False)
